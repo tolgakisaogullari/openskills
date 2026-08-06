@@ -103,6 +103,49 @@ check can detect a newer upstream via `git ls-remote --tags`.
 
 ### Fixed
 
+- **Embedding: an over-long chunk killed the Ollama model runner and silently punched
+  holes in the index (v0.12.1).** Field finding from a consuming repo: one ingest run
+  lost **2496 chunks across 617 files** while reporting `SUCCESS`. Ollama loads an
+  embedding model with `n_batch = n_ubatch = 2048`, and an embedding model is
+  **non-causal** — bidirectional attention needs the whole sequence in ONE ubatch, so
+  llama.cpp cannot split an over-long prompt: it aborts (`SIGTRAP`), the runner process
+  dies, and Ollama answers `500` to that request *and to every other request in flight*
+  (`MAX_WORKERS = 4`, so one bad chunk took three innocent neighbours with it). Bisected
+  and reproduced deterministically on `qwen3-embedding:0.6b`: 1970 tokens → `200`, 2104
+  tokens → `500`, cache-cold. Nothing caught it because `chunk_text` budgets **words**
+  while the limit is in **tokens** — the two differ by 2-7x, and a whitespace-free file
+  (minified bundle, base64 blob, single-line generated file) collapses to ONE "word" and
+  sails past any word budget. Four independent defects, all fixed:
+  - `get_embedding` now sends `options.num_batch` (default 8192, `SUMELA_EMBED_NUM_BATCH`)
+    — verified A/B, same input `500` → `200`.
+  - `chunk_text` now hard-bounds every emitted chunk, splitting by characters when words
+    cannot. The bound is `chars + 2`, which is **provable** rather than measured (a BPE
+    token always covers ≥1 char): measured chars/token runs 3.21 for Turkish prose down
+    to **1.00 for digit-heavy text, where 3054 chars produced 3055 tokens** — so every
+    ratio-based estimate tuned on prose under-counts digits, and under-counting is what
+    kills the runner. The token budget is **derived** from `num_batch` (90%) instead of
+    configured beside it, so lowering one cannot silently invalidate the other.
+  - `get_embedding` retries once: a neighbour killed as collateral damage succeeds on the
+    second attempt after Ollama restarts the runner.
+  - **Ingest is now all-or-nothing per file/page.** Previously a failed chunk was skipped
+    and the survivors were upserted *after deleting every existing point for that file* —
+    silently replacing a complete index entry with a partial one, and reporting `SUCCESS`.
+    A silently incomplete entry is worse than a stale one: retrieval answers confidently
+    from a file it only half knows. Files with any failed chunk are now left untouched,
+    counted in the report, and the run exits non-zero.
+
+  Also consolidates three private copies of `get_embedding` (and two of `chunk_text`) into
+  `lib/memory_ingest.py`. `session-ingest.py` and `query-qdrant.py` each shadowed the
+  shared helpers, so fixing the lib alone would have left the session-summary path **and
+  the query path** — which embeds caller-supplied text — still crashing. Covered by a new
+  dependency-free `tests/test_embedding_bounds.py` (wired into `tests/smoke.sh`, so CI
+  runs it) that pins the real measurements, the whitespace-free case, `num_batch` presence
+  and the retry contract.
+
+  **Consuming repos must re-ingest after updating** — the fix stops new damage but does
+  not repair points already missing: `python3 .sumela/memory-plugins/qdrant-session-memory/scripts/ingest-code-to-qdrant.py`
+  (and the wiki twin) for a full rebuild.
+
 - **graphify plugin: rebuilds hard-failed without an LLM key on repos with docs (v0.9.1).**
   Field report from a consuming repo (graphify CLI 0.8.35, 308 non-code doc/image files):
   `auto-update-memory.py` invoked `graphify .` / `graphify . --update`, which in current

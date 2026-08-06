@@ -52,13 +52,18 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 
-def report_success(pages_ingested: int, chunk_count: int, qdrant_ok: bool):
-    print_report("WIKI INGEST REPORT", [
-        f"Status: {'SUCCESS' if qdrant_ok else 'PARTIAL'}",
+def report_success(pages_ingested: int, chunk_count: int, qdrant_ok: bool,
+                   pages_skipped: int = 0):
+    lines = [
+        f"Status: {'SUCCESS' if qdrant_ok and not pages_skipped else 'PARTIAL'}",
         f"Pages ingested: {pages_ingested}",
         f"Total chunks: {chunk_count}",
         f"Qdrant upsert: {'OK' if qdrant_ok else 'FAILED'}",
-    ])
+    ]
+    if pages_skipped:
+        lines.append(f"Pages SKIPPED (embedding failed, left unchanged): {pages_skipped}")
+        lines.append("Action: re-run this ingest; these pages are NOT up to date in the index.")
+    print_report("WIKI INGEST REPORT", lines)
 
 
 def report_failure(stage: str, reason: str):
@@ -245,13 +250,15 @@ def main():
             except Exception as e:
                 embedding_map[key] = e
 
-    # Group by page_path for idempotent delete + upsert
+    # Group by page_path for idempotent delete + upsert. A page is ALL-OR-NOTHING:
+    # see the skip loop below.
     pages = {}
+    failed_pages = {}
     for page_path, page_title, fm, i, chunk, total in all_jobs:
         key = (page_path, i)
         emb = embedding_map.get(key)
         if isinstance(emb, Exception):
-            print(f"[warn] embedding failed for {page_path} chunk {i}: {emb}")
+            failed_pages.setdefault(page_path, []).append((i, emb))
             continue
         pages.setdefault(page_path, []).append({
             "page_title": page_title,
@@ -262,8 +269,18 @@ def main():
             "embedding": emb,
         })
 
+    # Any failed chunk disqualifies its whole page — writing the survivors would replace
+    # a complete index entry with a partial one and report success. Full reasoning lives
+    # in the code-ingest twin.
+    for page_path, failures in failed_pages.items():
+        pages.pop(page_path, None)
+        first_index, first_error = failures[0]
+        print(f"[warn] {page_path}: {len(failures)} chunk(s) failed to embed "
+              f"(first: chunk {first_index}: {first_error}) — page left unchanged in the index")
+
     for page_path, chunks_data in pages.items():
-        # Delete existing points for this page
+        # Delete existing points for this page. Safe only because every chunk of this
+        # page embedded successfully — pages with any failure were removed above.
         try:
             client.delete(
                 collection_name=COLLECTION_NAME,
@@ -309,8 +326,10 @@ def main():
             print(f"[warn] upsert failed for {page_path}: {e}")
 
     qdrant_ok = total_chunks > 0
-    report_success(pages_ingested, total_chunks, qdrant_ok)
-    sys.exit(0 if qdrant_ok else 1)
+    report_success(pages_ingested, total_chunks, qdrant_ok, len(failed_pages))
+    # Non-zero when pages were skipped: the index was not fully refreshed and the
+    # caller must not read "SUCCESS" and move on.
+    sys.exit(0 if qdrant_ok and not failed_pages else 1)
 
 
 if __name__ == "__main__":

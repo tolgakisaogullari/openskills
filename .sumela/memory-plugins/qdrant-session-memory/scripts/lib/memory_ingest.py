@@ -3,7 +3,7 @@ scripts/lib/memory_ingest.py — Shared ingestion utilities (v1.0)
 
 Common helpers for wiki and code ingestion pipelines.
 """
-import sys, os, re, hashlib, uuid
+import sys, os, re, time, hashlib, uuid
 from pathlib import Path
 from typing import List
 
@@ -302,28 +302,111 @@ def _warn(msg: str) -> None:
     print(f"[warn] {msg}", file=sys.stderr)
 
 
-def chunk_text(text: str, size: int = 512, overlap: int = 50) -> List[str]:
+# --- embedding input bounds --------------------------------------------------
+# Ollama loads an embedding model with n_batch = n_ubatch = 2048 by default. An
+# embedding model is NON-CAUSAL: bidirectional attention needs the whole sequence in
+# ONE ubatch, so llama.cpp cannot split an over-long prompt — it aborts (SIGTRAP) and
+# the runner process dies. Ollama then answers 500 to that request AND to every other
+# request in flight, so one oversized chunk also kills its concurrent neighbours.
+#
+# Two independent guards, because either alone is insufficient: NUM_BATCH raises the
+# ceiling but leaves an unbounded chunk unbounded, and MAX_TOKENS bounds the input but
+# cannot help a caller that overrides it. Measured on qwen3-embedding:0.6b — 2048 is a
+# hard cliff (1970 tokens → 200, 2104 tokens → 500, deterministic when uncached).
+DEFAULT_EMBED_MODEL = "qwen3-embedding:0.6b"
+EMBED_NUM_BATCH = int(os.getenv("SUMELA_EMBED_NUM_BATCH", "8192"))
+EMBED_RETRY_DELAY_SECONDS = float(os.getenv("SUMELA_EMBED_RETRY_DELAY", "2"))
+
+# The token budget is DERIVED from the batch size rather than configured beside it.
+# Two independently-set numbers carrying an invariant ("budget < batch") drift the day
+# somebody lowers one of them, and the symptom — a dead runner — surfaces nowhere near
+# the config change. 90% leaves room for the special tokens the server appends.
+EMBED_MAX_TOKENS = int(os.getenv("SUMELA_EMBED_MAX_TOKENS", str(EMBED_NUM_BATCH * 9 // 10)))
+if EMBED_MAX_TOKENS >= EMBED_NUM_BATCH:
+    print(f"[warn] SUMELA_EMBED_MAX_TOKENS ({EMBED_MAX_TOKENS}) must stay below "
+          f"SUMELA_EMBED_NUM_BATCH ({EMBED_NUM_BATCH}); clamping.", file=sys.stderr)
+    EMBED_MAX_TOKENS = EMBED_NUM_BATCH * 9 // 10
+
+
+def estimate_tokens(text: str) -> int:
+    """HARD upper bound on the token count — provable, not a measured heuristic.
+
+    A BPE token always covers at least one character, so the token count can never
+    exceed the character count plus the handful of special tokens the server appends
+    (this model sets add_eos_token). Measured on qwen3-embedding:0.6b, chars/token runs
+    3.21 for Turkish prose, 1.76 for minified JSON, 1.50 for pure punctuation, 1.38 for
+    base64 — and 1.00 for digit-heavy text, where 3054 chars produced 3055 tokens. That
+    last sample is why this is a bound and not a ratio: any ratio-based estimate that
+    looks reasonable for prose under-counts digits, and under-counting is what kills the
+    runner. Over-counting only costs an extra split.
+    """
+    return len(text) + 2
+
+
+def _split_oversized(chunk: str, max_tokens: int) -> List[str]:
+    """Split a chunk whose estimated tokens exceed max_tokens, by CHARACTERS.
+
+    Word-based chunking cannot bound text with few or no whitespace breaks — a minified
+    bundle, a base64 blob or a single-line generated file collapses to ONE "word" and
+    sails past any word budget however small. Sizing the fallback from the same estimate
+    keeps every emitted chunk bounded regardless of what the input looks like.
+    """
+    if estimate_tokens(chunk) <= max_tokens:
+        return [chunk]
+    max_chars = max(1, max_tokens - 2)   # inverse of the bound in estimate_tokens
+    return [chunk[i:i + max_chars] for i in range(0, len(chunk), max_chars)]
+
+
+def chunk_text(text: str, size: int = 512, overlap: int = 50,
+               max_tokens: int = None) -> List[str]:
+    """Split text into overlapping chunks of `size` WORDS, then hard-bound each chunk.
+
+    `size` is a word budget, not a token budget — the two differ by 2-7x depending on
+    content, which is why the token bound below exists rather than a smaller `size`.
+    """
+    if not text.strip():
+        return []
+    max_tokens = EMBED_MAX_TOKENS if max_tokens is None else max_tokens
     words = text.split()
     if len(words) <= size:
-        return [text] if text.strip() else []
+        raw = [text]
+    else:
+        raw = []
+        start = 0
+        while start < len(words):
+            end = min(start + size, len(words))
+            raw.append(" ".join(words[start:end]))
+            start += size - overlap
     chunks = []
-    start = 0
-    while start < len(words):
-        end = min(start + size, len(words))
-        chunks.append(" ".join(words[start:end]))
-        start += size - overlap
+    for c in raw:
+        chunks.extend(_split_oversized(c, max_tokens))
     return chunks
 
 
-def get_embedding(text: str, ollama_url: str, model: str = "qwen3-embedding:0.6b", timeout: int = 120) -> List[float]:
+def get_embedding(text: str, ollama_url: str, model: str = DEFAULT_EMBED_MODEL,
+                  timeout: int = 120, retries: int = 1) -> List[float]:
+    """Embed one chunk. Raises on failure so the caller can record it — see the
+    bounds note above for why `num_batch` is sent and why a retry is worth having:
+    when a runner dies on somebody else's oversized prompt, the concurrent requests
+    that were collateral damage succeed on a second attempt once it restarts.
+    """
     import requests
-    resp = requests.post(
-        f"{ollama_url}/api/embeddings",
-        json={"model": model, "prompt": text},
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    return resp.json()["embedding"]
+    payload = {
+        "model": model,
+        "prompt": text,
+        "options": {"num_batch": EMBED_NUM_BATCH},
+    }
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(f"{ollama_url}/api/embeddings", json=payload, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()["embedding"]
+        except Exception as e:      # noqa: BLE001 — re-raised below once retries are spent
+            last_error = e
+            if attempt < retries:
+                time.sleep(EMBED_RETRY_DELAY_SECONDS)
+    raise last_error
 
 
 def deterministic_id(key: str, chunk_index: int) -> str:

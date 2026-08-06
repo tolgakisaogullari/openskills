@@ -9,7 +9,7 @@ Usage:
 What it does:
     1. Reads the session summary markdown.
     2. Extracts structured metadata: session_date, topics, decisions, affected_files.
-    3. Chunks the body (512 tokens, 50 overlap).
+    3. Chunks the body (512 words, 50 overlap), token-bounded — see lib.memory_ingest.
     4. Generates embeddings via Ollama (qwen3-embedding:0.6b).
     5. Deletes any prior points for this session, then upserts the fresh chunks
        into Qdrant 'chat_history' with enriched payload (idempotent re-ingest).
@@ -54,7 +54,13 @@ from pathlib import Path
 from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.memory_ingest import resolve_collection_arg, project_slug, qdrant_client_preflight
+from lib.memory_ingest import (
+    resolve_collection_arg, project_slug, qdrant_client_preflight,
+    # chunk_text/get_embedding live in the lib so the embedding-input bounds they carry
+    # apply to EVERY path. Private copies here and in query-qdrant.py were the reason a
+    # fix to the lib alone would have left the summary and query paths still crashing.
+    chunk_text, get_embedding,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -105,9 +111,6 @@ except ImportError:
     report_failure("Dependency", "qdrant-client not installed. Run: pip install qdrant-client")
     sys.exit(1)
 
-CHUNK_SIZE = 512
-OVERLAP = 50
-
 # Common code-file path patterns (Windows + POSIX)
 FILE_PATTERN = re.compile(
     r"\b(?:src|tests|docs|scripts|nginx)[\\/][\w\-\.\\/]+\.(?:cs|ts|tsx|js|jsx|py|md|json|yml|yaml|sql|csproj)\b",
@@ -131,29 +134,6 @@ def deterministic_id(key: str, chunk_index: int) -> str:
     """
     hex_str = hashlib.sha256(f"{key}_{chunk_index}".encode("utf-8")).hexdigest()[:32]
     return str(uuid.UUID(hex=hex_str))
-
-
-def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = OVERLAP) -> List[str]:
-    words = text.split()
-    if len(words) <= size:
-        return [text]
-    chunks = []
-    start = 0
-    while start < len(words):
-        end = min(start + size, len(words))
-        chunks.append(" ".join(words[start:end]))
-        start += size - overlap
-    return chunks
-
-
-def get_embedding(text: str, ollama_url: str) -> List[float]:
-    resp = requests.post(
-        f"{ollama_url}/api/embeddings",
-        json={"model": "qwen3-embedding:0.6b", "prompt": text},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["embedding"]
 
 
 def extract_frontmatter(content: str) -> dict:

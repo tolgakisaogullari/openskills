@@ -55,14 +55,19 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 
-def report_success(files_ingested: int, chunk_count: int, qdrant_ok: bool, mode: str):
-    print_report("CODE INGEST REPORT", [
-        f"Status: {'SUCCESS' if qdrant_ok else 'PARTIAL'}",
+def report_success(files_ingested: int, chunk_count: int, qdrant_ok: bool, mode: str,
+                   files_skipped: int = 0):
+    lines = [
+        f"Status: {'SUCCESS' if qdrant_ok and not files_skipped else 'PARTIAL'}",
         f"Mode: {mode}",
         f"Files ingested: {files_ingested}",
         f"Total chunks: {chunk_count}",
         f"Qdrant upsert: {'OK' if qdrant_ok else 'FAILED'}",
-    ])
+    ]
+    if files_skipped:
+        lines.append(f"Files SKIPPED (embedding failed, left unchanged): {files_skipped}")
+        lines.append("Action: re-run this ingest; these files are NOT up to date in the index.")
+    print_report("CODE INGEST REPORT", lines)
 
 
 def report_failure(stage: str, reason: str):
@@ -323,13 +328,15 @@ def main():
             except Exception as e:
                 embedding_map[key] = e
 
-    # Group by rel_path for idempotent delete + upsert
+    # Group by rel_path for idempotent delete + upsert. A file is ALL-OR-NOTHING:
+    # see the skip loop below.
     files = {}
+    failed_files = {}
     for rel_path, file_type, i, chunk, total in all_jobs:
         key = (rel_path, i)
         emb = embedding_map.get(key)
         if isinstance(emb, Exception):
-            print(f"[warn] embedding failed for {rel_path} chunk {i}: {emb}")
+            failed_files.setdefault(rel_path, []).append((i, emb))
             continue
         files.setdefault(rel_path, []).append({
             "file_type": file_type,
@@ -339,13 +346,25 @@ def main():
             "embedding": emb,
         })
 
+    # Any failed chunk disqualifies its whole file. Writing the survivors would mean
+    # deleting a complete index entry and replacing it with a partial one — and
+    # reporting success. A silently incomplete entry is worse than a stale one:
+    # retrieval answers confidently from a file it only half knows. Leave the file's
+    # existing points untouched instead, and say so.
+    for rel_path, failures in failed_files.items():
+        files.pop(rel_path, None)
+        first_index, first_error = failures[0]
+        print(f"[warn] {rel_path}: {len(failures)} chunk(s) failed to embed "
+              f"(first: chunk {first_index}: {first_error}) — file left unchanged in the index")
+
     total_chunks = 0
     files_ingested = 0
 
     for rel_path, chunks_data in files.items():
-        # Delete ALL existing points for this file (by file_path) BEFORE upserting —
-        # this also evicts stale higher-index chunks if the file shrank or some
-        # chunks failed to embed, keeping the index a faithful mirror of the file.
+        # Delete ALL existing points for this file (by file_path) BEFORE upserting, so a
+        # file that shrank does not leave stale higher-index chunks behind. Safe only
+        # because every chunk of this file embedded successfully — files with any
+        # failure were removed above and never reach this delete.
         try:
             client.delete(
                 collection_name=COLLECTION_NAME,
@@ -383,8 +402,10 @@ def main():
             print(f"[warn] upsert failed for {rel_path}: {e}")
 
     qdrant_ok = total_chunks > 0
-    report_success(files_ingested, total_chunks, qdrant_ok, mode)
-    sys.exit(0 if qdrant_ok else 1)
+    report_success(files_ingested, total_chunks, qdrant_ok, mode, len(failed_files))
+    # A run that skipped files did NOT fully refresh the index — exit non-zero so a
+    # caller (hook, CI, operator) sees it rather than reading "SUCCESS" and moving on.
+    sys.exit(0 if qdrant_ok and not failed_files else 1)
 
 
 if __name__ == "__main__":

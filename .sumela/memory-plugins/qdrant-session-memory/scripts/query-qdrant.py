@@ -33,7 +33,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.memory_ingest import resolve_collection_arg, COLLECTION_BASES, qdrant_client_preflight
+from lib.memory_ingest import (
+    resolve_collection_arg, COLLECTION_BASES, qdrant_client_preflight,
+    # Shared with the ingest paths so a long QUERY is bounded too — this path embeds
+    # caller-supplied text and would otherwise kill the runner exactly like an
+    # oversized ingest chunk.
+    get_embedding,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -193,16 +199,6 @@ def build_filter(developer: str = "", domain: str = "", since: str = "", until: 
 DEFAULT_COLLECTION = "chat_history"
 DEFAULT_LIMIT = 5
 DEFAULT_THRESHOLD = 0.0
-
-
-def get_embedding(text: str, ollama_url: str) -> list[float]:
-    resp = requests.post(
-        f"{ollama_url}/api/embeddings",
-        json={"model": "qwen3-embedding:0.6b", "prompt": text},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["embedding"]
 
 
 def query_qdrant(

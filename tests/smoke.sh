@@ -125,8 +125,15 @@ if command -v python3 >/dev/null 2>&1; then
   else
     bad "extra ingest dirs unit test failed"; sed 's/^/    /' "$WORK/extra_ingest.log" | tail -20
   fi
+  # Embedding input bounds: an over-long prompt aborts the Ollama model runner, which
+  # 500s every concurrent request too — silently losing chunks from the index.
+  if python3 "$REPO_ROOT/tests/test_embedding_bounds.py" >"$WORK/embed_bounds.log" 2>&1; then
+    ok "embedding bounds: token cap, num_batch, retry"
+  else
+    bad "embedding bounds unit test failed"; sed 's/^/    /' "$WORK/embed_bounds.log" | tail -20
+  fi
 else
-  echo "  SKIP  get_repo_root + extra-ingest unit tests (python3 unavailable)"
+  echo "  SKIP  get_repo_root + extra-ingest + embedding-bounds unit tests (python3 unavailable)"
 fi
 
 echo ""
