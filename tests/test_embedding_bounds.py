@@ -135,6 +135,10 @@ def main():
     check("max-token budget leaves headroom under num_batch",
           _mod.EMBED_MAX_TOKENS < _mod.EMBED_NUM_BATCH)
 
+    # Concurrency default is measured (12.3 chunk/s at 1 worker, 24.3 at 4, 23.9 at 8),
+    # and must stay >= 1: ThreadPoolExecutor(max_workers=0) raises.
+    check("embed worker count is a positive integer", _mod.EMBED_MAX_WORKERS >= 1)
+
     # --- get_embedding: one retry, because neighbours are collateral damage ---------
     # When a runner dies on somebody else's oversized prompt, the concurrent requests
     # also get a 500. Ollama restarts it, so those succeed on a second attempt.

@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.memory_ingest import (
     get_repo_root, chunk_text, get_embedding, deterministic_id, print_report,
-    resolve_collection_arg, project_slug, qdrant_client_preflight,
+    resolve_collection_arg, project_slug, qdrant_client_preflight, EMBED_MAX_WORKERS,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -103,7 +103,7 @@ COLLECTION_NAME = resolve_collection_arg("code_chunks")
 PROJECT_SLUG = project_slug()
 CHUNK_SIZE = 512
 OVERLAP = 50
-MAX_WORKERS = 4
+MAX_WORKERS = EMBED_MAX_WORKERS      # measured default + env override — see lib.memory_ingest
 
 # MUST stay in sync with setup-qdrant.py (same collection, same vector geometry) —
 # a mismatch makes upserts fail with a dimension error.

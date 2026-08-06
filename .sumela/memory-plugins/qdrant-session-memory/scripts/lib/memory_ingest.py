@@ -317,6 +317,14 @@ DEFAULT_EMBED_MODEL = "qwen3-embedding:0.6b"
 EMBED_NUM_BATCH = int(os.getenv("SUMELA_EMBED_NUM_BATCH", "8192"))
 EMBED_RETRY_DELAY_SECONDS = float(os.getenv("SUMELA_EMBED_RETRY_DELAY", "2"))
 
+# Concurrent embed requests during a bulk ingest. 4 is measured, not assumed: on 60 real
+# code chunks (~2.6 KB each) throughput ran 12.3 chunk/s at 1 worker, 21.1 at 2, 24.3 at
+# 4 and 23.9 at 8 — so it saturates at 4 and 8 buys nothing. The gain survives even with
+# OLLAMA_NUM_PARALLEL=1 (a single runner slot) because it is PIPELINING, not parallel
+# compute: the next requests are already queued at the server, keeping the HTTP round
+# trip and client overhead off the critical path. Lower it on a memory-constrained host.
+EMBED_MAX_WORKERS = max(1, int(os.getenv("SUMELA_EMBED_MAX_WORKERS", "4")))
+
 # The token budget is DERIVED from the batch size rather than configured beside it.
 # Two independently-set numbers carrying an invariant ("budget < batch") drift the day
 # somebody lowers one of them, and the symptom — a dead runner — surfaces nowhere near

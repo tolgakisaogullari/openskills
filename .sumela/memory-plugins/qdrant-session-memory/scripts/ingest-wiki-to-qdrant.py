@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.memory_ingest import (
     get_repo_root, get_extra_ingest_dirs, chunk_text, get_embedding,
     deterministic_id, print_report, resolve_collection_arg, project_slug,
-    qdrant_client_preflight,
+    qdrant_client_preflight, EMBED_MAX_WORKERS,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -96,7 +96,7 @@ COLLECTION_NAME = resolve_collection_arg("wiki_pages")
 PROJECT_SLUG = project_slug()
 CHUNK_SIZE = 512
 OVERLAP = 50
-MAX_WORKERS = 4
+MAX_WORKERS = EMBED_MAX_WORKERS      # measured default + env override — see lib.memory_ingest
 
 REPO_ROOT = get_repo_root()
 WIKI_DIR = REPO_ROOT / os.getenv("WIKI_DIR", "docs/second-brain/wiki")

@@ -142,6 +142,16 @@ check can detect a newer upstream via `git ls-remote --tags`.
   runs it) that pins the real measurements, the whitespace-free case, `num_batch` presence
   and the retry contract.
 
+  The bulk-ingest worker count moves to `lib` as `EMBED_MAX_WORKERS`
+  (`SUMELA_EMBED_MAX_WORKERS`, clamped to ≥1) so a memory-constrained host can lower it.
+  The default stays **4 — measured, not assumed**: on 60 real code chunks throughput ran
+  12.3 chunk/s at 1 worker, 21.1 at 2, 24.3 at 4 and 23.9 at 8, so it saturates at 4. The
+  gain holds even with `OLLAMA_NUM_PARALLEL=1` because it is pipelining rather than
+  parallel compute — the next requests are already queued at the server, keeping the HTTP
+  round trip off the critical path. (Concurrency was initially suspected of only
+  multiplying a crash's blast radius; the measurement said otherwise, and the retry plus
+  all-or-nothing changes above address the blast radius directly.)
+
   **Consuming repos must re-ingest after updating** — the fix stops new damage but does
   not repair points already missing: `python3 .sumela/memory-plugins/qdrant-session-memory/scripts/ingest-code-to-qdrant.py`
   (and the wiki twin) for a full rebuild.
