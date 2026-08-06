@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.memory_ingest import (
     get_repo_root, get_extra_ingest_dirs, chunk_text, get_embedding,
     deterministic_id, print_report, resolve_collection_arg, project_slug,
-    qdrant_client_preflight, EMBED_MAX_WORKERS,
+    qdrant_client_preflight, EMBED_MAX_WORKERS, ollama_preflight,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -53,15 +53,19 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 def report_success(pages_ingested: int, chunk_count: int, qdrant_ok: bool,
-                   pages_skipped: int = 0):
+                   pages_skipped: int = 0, upsert_failed: int = 0):
+    clean = qdrant_ok and not pages_skipped and not upsert_failed
     lines = [
-        f"Status: {'SUCCESS' if qdrant_ok and not pages_skipped else 'PARTIAL'}",
+        f"Status: {'SUCCESS' if clean else 'PARTIAL'}",
         f"Pages ingested: {pages_ingested}",
         f"Total chunks: {chunk_count}",
         f"Qdrant upsert: {'OK' if qdrant_ok else 'FAILED'}",
     ]
     if pages_skipped:
         lines.append(f"Pages SKIPPED (embedding failed, left unchanged): {pages_skipped}")
+    if upsert_failed:
+        lines.append(f"Pages whose points were DELETED but not replaced (upsert failed): {upsert_failed}")
+    if pages_skipped or upsert_failed:
         lines.append("Action: re-run this ingest; these pages are NOT up to date in the index.")
     print_report("WIKI INGEST REPORT", lines)
 
@@ -207,11 +211,19 @@ def main():
                                 f"and no extra ingest dirs configured")
         sys.exit(1)
 
+    # Check the embedding backend before building work — a stopped Ollama otherwise
+    # costs a full run of retry sleeps and reports every page as broken.
+    ollama_down = ollama_preflight(OLLAMA_URL)
+    if ollama_down:
+        report_failure("Dependency", ollama_down)
+        sys.exit(1)
+
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, check_compatibility=False)
 
     doc_files = collect_doc_files()  # ordered, deduped (md_path, page_path) across wiki + extra dirs
     total_chunks = 0
     pages_ingested = 0
+    upsert_failed = set()
 
     # Collect all chunks first for parallel embedding
     all_jobs = []  # (page_path, page_title, fm, chunk_index, chunk_text, total_chunks)
@@ -323,13 +335,17 @@ def main():
             pages_ingested += 1
             print(f"  Ingested: {page_path} ({len(points)} chunks)")
         except Exception as e:
-            print(f"[warn] upsert failed for {page_path}: {e}")
+            # The delete above already ran — this page's points are gone and were not
+            # replaced. Same silent hole the all-or-nothing rule closes on the embed side.
+            upsert_failed.add(page_path)
+            print(f"[warn] upsert failed for {page_path}: {e} — its points were deleted "
+                  f"and NOT replaced; re-run to restore")
 
     qdrant_ok = total_chunks > 0
-    report_success(pages_ingested, total_chunks, qdrant_ok, len(failed_pages))
-    # Non-zero when pages were skipped: the index was not fully refreshed and the
-    # caller must not read "SUCCESS" and move on.
-    sys.exit(0 if qdrant_ok and not failed_pages else 1)
+    report_success(pages_ingested, total_chunks, qdrant_ok, len(failed_pages), len(upsert_failed))
+    # Non-zero when pages were skipped or lost their points: the index was not fully
+    # refreshed and the caller must not read "SUCCESS" and move on.
+    sys.exit(0 if qdrant_ok and not failed_pages and not upsert_failed else 1)
 
 
 if __name__ == "__main__":

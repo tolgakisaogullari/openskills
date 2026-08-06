@@ -41,6 +41,7 @@ docs/second-brain/wiki/
 .sumela/.retrieval-cache.json
 .sumela/.heal-last
 .sumela/.heal-state-*.json
+.sumela/.ingest.lock/
 
 # Per-developer overrides (personal; .example stays tracked)
 .sumela/local.md

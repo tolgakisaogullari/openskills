@@ -444,6 +444,10 @@ sumela_wiki_sync() {  # $1 = "from" ref, $2 = "to" ref
 _sumela_heal_due() {  # $1 = install root
   local marker="$1/.sumela/.heal-last"
   local interval="${SUMELA_HEAL_INTERVAL_SECONDS:-21600}"   # 6h
+  # A non-numeric override (`=6h` is the obvious mistake) would make `[` print
+  # "integer expression expected" into EVERY git command and return 2 — read as
+  # "not due", silently disabling healing forever. Fall back instead.
+  case "$interval" in ''|*[!0-9]*) interval=21600 ;; esac
   [ -f "$marker" ] || return 0
   local now last
   now="$(date +%s 2>/dev/null)" || return 1
@@ -452,8 +456,15 @@ _sumela_heal_due() {  # $1 = install root
   [ $(( now - last )) -ge "$interval" ]
 }
 
+# Returns non-zero when the marker could NOT be written. Two subtleties, both learned
+# the hard way: `cmd > file 2>/dev/null` silences the COMMAND, not the redirection, so
+# an unwritable path still prints "No such file or directory" into every git checkout —
+# the redirect must be inside a group for the suppression to cover it. And swallowing
+# the failure would leave the throttle permanently un-armed, forking a background
+# ingest on every git operation; the caller skips the heal instead, because an
+# unthrottleable heal is worse than a postponed one.
 _sumela_heal_mark() {  # $1 = install root
-  date +%s > "$1/.sumela/.heal-last" 2>/dev/null || true
+  { date +%s > "$1/.sumela/.heal-last"; } 2>/dev/null
 }
 
 sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
@@ -528,22 +539,49 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
     echo "sumela: re-embedding $(printf '%s\n' "$changed" | grep -c .) changed code file(s) into Qdrant code_chunks in background (incremental; log: .sumela/.memory-sync.log)"
   fi
 
-  [ -n "$heal" ] && _sumela_heal_mark "$install"
+  if [ -n "$heal" ]; then
+    # An unwritable marker means the throttle cannot arm; running anyway would fork an
+    # ingest on every single git operation. Drop the heal and keep the normal sync.
+    _sumela_heal_mark "$install" || heal=""
+  fi
+  [ -n "$changed$full$heal" ] || return 0
+
+  # A heal-only run against a pre-0.12.1 ingest would die on `unrecognized arguments`,
+  # and because both jobs share one invocation that would take the incremental re-embed
+  # down with it. Teammates get every framework file atomically from one pull, but
+  # `update.sh --review` lets a maintainer apply _lib.sh while skipping the plugin.
+  if [ -n "$heal" ] && ! grep -q -- '--heal' "$ingest" 2>/dev/null; then
+    heal=""
+    [ -n "$changed" ] || return 0
+  fi
 
   ( trap '[ -n "$changed_list" ] && rm -f "$changed_list"' EXIT   # clean up even if cd below fails
     cd "$install" || exit 0
+    # One ingest at a time per install. Merging heal into the incremental invocation
+    # only serialises work within ONE hook call; a heal can run for minutes, so the
+    # NEXT commit's incremental run would otherwise delete-then-upsert the same file
+    # paths concurrently and the slower run would win with staler content.
+    lock="$install/.sumela/.ingest.lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+      # Stale lock (killed process, crashed shell) must not disable sync forever.
+      if [ -n "$(find "$lock" -maxdepth 0 -mmin +120 2>/dev/null)" ]; then
+        rmdir "$lock" 2>/dev/null && mkdir "$lock" 2>/dev/null || exit 0
+      else
+        echo "===== code-sync: skipped, another ingest holds $lock ====="
+        exit 0
+      fi
+    fi
+    trap 'rmdir "$lock" 2>/dev/null; [ -n "$changed_list" ] && rm -f "$changed_list"' EXIT
     echo "===== code-sync(ingest) @ $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) ====="
-    local ok=0
+    ok=0
     if [ -n "$full" ]; then
       python3 "$ingest" || ok=1
     elif [ -n "$changed_list" ]; then
-      # ONE run for both jobs — two ingests racing over the same collection would
-      # delete-then-upsert the same file paths concurrently.
       python3 "$ingest" --changed-file "$changed_list" ${heal:+--heal} || ok=1
     else
       python3 "$ingest" --heal || ok=1
     fi
-    [ "$ok" -ne 0 ] && echo "WARN: code ingest failed"
+    [ "$ok" -ne 0 ] && echo "WARN: code ingest reported a problem (see the report above)"
     echo "===== code-sync: done ====="
   ) >>"$log" 2>&1 </dev/null &
   return 0

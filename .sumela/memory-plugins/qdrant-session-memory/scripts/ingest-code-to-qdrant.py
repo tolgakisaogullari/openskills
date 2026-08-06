@@ -50,7 +50,7 @@ from lib.memory_ingest import (
     get_repo_root, chunk_text, get_embedding, deterministic_id, print_report,
     resolve_collection_arg, project_slug, qdrant_client_preflight, EMBED_MAX_WORKERS,
     scan_entry_completeness, load_heal_state, save_heal_state, apply_heal_outcome,
-    HEAL_MAX_ATTEMPTS,
+    HEAL_MAX_ATTEMPTS, ollama_preflight,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -58,9 +58,10 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 def report_success(files_ingested: int, chunk_count: int, qdrant_ok: bool, mode: str,
-                   files_skipped: int = 0):
+                   files_skipped: int = 0, upsert_failed: int = 0):
+    clean = qdrant_ok and not files_skipped and not upsert_failed
     lines = [
-        f"Status: {'SUCCESS' if qdrant_ok and not files_skipped else 'PARTIAL'}",
+        f"Status: {'SUCCESS' if clean else 'PARTIAL'}",
         f"Mode: {mode}",
         f"Files ingested: {files_ingested}",
         f"Total chunks: {chunk_count}",
@@ -68,6 +69,9 @@ def report_success(files_ingested: int, chunk_count: int, qdrant_ok: bool, mode:
     ]
     if files_skipped:
         lines.append(f"Files SKIPPED (embedding failed, left unchanged): {files_skipped}")
+    if upsert_failed:
+        lines.append(f"Files whose points were DELETED but not replaced (upsert failed): {upsert_failed}")
+    if files_skipped or upsert_failed:
         lines.append("Action: re-run this ingest; these files are NOT up to date in the index.")
     print_report("CODE INGEST REPORT", lines)
 
@@ -295,10 +299,25 @@ def main():
         report_failure("Collection", f"Qdrant unavailable: {e}")
         sys.exit(1)
 
+    # Embedding is the expensive half and the one that fails silently — check it before
+    # building any work, so a stopped Ollama costs one HTTP call instead of hours of
+    # retry sleeps, and records no heal strikes against files that are perfectly fine.
+    ollama_down = ollama_preflight(OLLAMA_URL)
+    if ollama_down:
+        report_failure("Dependency", ollama_down)
+        sys.exit(1)
+
     incremental = args.changed_file is not None or args.heal
-    # An empty collection is not damage to heal — it is a first build. Defer to the
-    # existing promotion so a fresh clone does not report 15k "incomplete" files.
+    # An empty collection is not damage to heal — it is a first build. A run that was
+    # ASKED to do incremental work promotes to a full build; a heal-only run must NOT,
+    # or an ordinary branch switch on a fresh/wiped index silently embeds the whole tree
+    # in the background with nothing on screen to explain the machine getting busy.
     if incremental and empty:
+        if args.heal and not args.changed_file:
+            print(f"[info] '{COLLECTION_NAME}' is empty — nothing to heal "
+                  f"(a first build runs on the next code change, or run this script with no flags)")
+            report_success(0, 0, True, "heal")
+            sys.exit(0)
         print(f"[info] '{COLLECTION_NAME}' is empty — promoting incremental run to a full build")
         incremental = False
 
@@ -412,6 +431,7 @@ def main():
     total_chunks = 0
     files_ingested = 0
     upserted_ok = set()
+    upsert_failed = set()
 
     for rel_path, chunks_data in files.items():
         # Delete ALL existing points for this file (by file_path) BEFORE upserting, so a
@@ -453,7 +473,12 @@ def main():
             upserted_ok.add(rel_path)
             print(f"  Ingested: {rel_path} ({len(points)} chunks)")
         except Exception as e:
-            print(f"[warn] upsert failed for {rel_path}: {e}")
+            # The delete above already ran, so this file's points are GONE. That is the
+            # same silent hole the all-or-nothing rule closes on the embed side, so it
+            # must be counted and surfaced — never reported as a success.
+            upsert_failed.add(rel_path)
+            print(f"[warn] upsert failed for {rel_path}: {e} — its points were deleted "
+                  f"and NOT replaced; re-run to restore")
 
     if args.heal and heal_paths:
         # "Unresolved" is anything we tried to heal that did NOT end up upserted — a
@@ -466,10 +491,12 @@ def main():
                                            attempted, attempted - upserted_ok))
 
     qdrant_ok = total_chunks > 0
-    report_success(files_ingested, total_chunks, qdrant_ok, mode, len(failed_files))
-    # A run that skipped files did NOT fully refresh the index — exit non-zero so a
-    # caller (hook, CI, operator) sees it rather than reading "SUCCESS" and moving on.
-    sys.exit(0 if qdrant_ok and not failed_files else 1)
+    report_success(files_ingested, total_chunks, qdrant_ok, mode,
+                   len(failed_files), len(upsert_failed))
+    # A run that skipped files or lost points to a failed upsert did NOT fully refresh
+    # the index — exit non-zero so a caller (hook, CI, operator) sees it rather than
+    # reading "SUCCESS" and moving on.
+    sys.exit(0 if qdrant_ok and not failed_files and not upsert_failed else 1)
 
 
 if __name__ == "__main__":

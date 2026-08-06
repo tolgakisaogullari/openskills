@@ -337,32 +337,50 @@ if EMBED_MAX_TOKENS >= EMBED_NUM_BATCH:
 
 
 def estimate_tokens(text: str) -> int:
-    """HARD upper bound on the token count — provable, not a measured heuristic.
+    """HARD upper bound on the token count. Counts UTF-8 BYTES, not characters.
 
-    A BPE token always covers at least one character, so the token count can never
-    exceed the character count plus the handful of special tokens the server appends
-    (this model sets add_eos_token). Measured on qwen3-embedding:0.6b, chars/token runs
-    3.21 for Turkish prose, 1.76 for minified JSON, 1.50 for pure punctuation, 1.38 for
-    base64 — and 1.00 for digit-heavy text, where 3054 chars produced 3055 tokens. That
-    last sample is why this is a bound and not a ratio: any ratio-based estimate that
-    looks reasonable for prose under-counts digits, and under-counting is what kills the
-    runner. Over-counting only costs an extra split.
+    Qwen (like most modern models) uses BYTE-level BPE: a token covers at least one
+    *byte*, not one character. Python's len() counts codepoints, so a character-based
+    bound silently under-counts every multi-byte script by up to 4x — and under-counting
+    is exactly what kills the runner. Measured live at the 7372-codepoint bound this
+    module used to allow: Cyrillic reached 14,740 bytes and common CJK 22,110, and the
+    CJK chunk returned HTTP 500 while the estimate still read 7372. CJK is the worst
+    case in practice because it has no word spaces, so a whole paragraph collapses to
+    one "word" and always takes the character-split path.
+
+    The +2 covers the special tokens the server appends (this model sets add_eos_token);
+    that margin is why digit-heavy ASCII — 3054 bytes producing 3055 tokens, the densest
+    single-byte case measured — still fits under the bound.
     """
-    return len(text) + 2
+    return len(text.encode("utf-8")) + 2
 
 
 def _split_oversized(chunk: str, max_tokens: int) -> List[str]:
-    """Split a chunk whose estimated tokens exceed max_tokens, by CHARACTERS.
+    """Split a chunk whose estimated tokens exceed max_tokens, by UTF-8 BYTE budget.
 
     Word-based chunking cannot bound text with few or no whitespace breaks — a minified
-    bundle, a base64 blob or a single-line generated file collapses to ONE "word" and
-    sails past any word budget however small. Sizing the fallback from the same estimate
-    keeps every emitted chunk bounded regardless of what the input looks like.
+    bundle, a base64 blob, a single-line generated file, or any CJK prose — because all
+    of those collapse to ONE "word" and sail past any word budget however small.
+
+    Accumulates per CHARACTER while counting BYTES so a multi-byte codepoint is never
+    split down the middle (which would emit invalid text and corrupt the stored chunk).
+    A single character wider than the whole budget cannot be split further and is
+    emitted alone; that needs a budget under ~4 bytes to happen, so it is theoretical.
     """
     if estimate_tokens(chunk) <= max_tokens:
         return [chunk]
-    max_chars = max(1, max_tokens - 2)   # inverse of the bound in estimate_tokens
-    return [chunk[i:i + max_chars] for i in range(0, len(chunk), max_chars)]
+    max_bytes = max(1, max_tokens - 2)   # inverse of the bound in estimate_tokens
+    out, buf, size = [], [], 0
+    for ch in chunk:
+        width = len(ch.encode("utf-8"))
+        if size + width > max_bytes and buf:
+            out.append("".join(buf))
+            buf, size = [], 0
+        buf.append(ch)
+        size += width
+    if buf:
+        out.append("".join(buf))
+    return out
 
 
 def chunk_text(text: str, size: int = 512, overlap: int = 50,
@@ -393,12 +411,24 @@ def chunk_text(text: str, size: int = 512, overlap: int = 50,
 
 def get_embedding(text: str, ollama_url: str, model: str = DEFAULT_EMBED_MODEL,
                   timeout: int = 120, retries: int = 1) -> List[float]:
-    """Embed one chunk. Raises on failure so the caller can record it — see the
-    bounds note above for why `num_batch` is sent and why a retry is worth having:
-    when a runner dies on somebody else's oversized prompt, the concurrent requests
-    that were collateral damage succeed on a second attempt once it restarts.
+    """Embed one string. Raises on failure so the caller can record it.
+
+    The length bound is enforced HERE, not left to the caller. It used to live only in
+    `chunk_text`, which meant any caller that did not chunk first silently opted out of
+    the invariant this module defines — and `query-qdrant.py` is exactly that caller: it
+    embeds raw user query text. Truncating is the right degradation for a query (an
+    8k-token query is degenerate; searching its head beats killing the runner and every
+    concurrent request with it) and is a no-op for the ingest paths, which pre-split.
+
+    The retry covers collateral damage: when a runner dies on somebody else's request,
+    the concurrent ones also get a 500 and succeed on a second attempt once Ollama
+    restarts it.
     """
     import requests
+    if estimate_tokens(text) > EMBED_MAX_TOKENS:
+        _warn(f"embedding input exceeds the {EMBED_MAX_TOKENS}-token budget "
+              f"({estimate_tokens(text)}); truncating to fit")
+        text = _split_oversized(text, EMBED_MAX_TOKENS)[0]
     payload = {
         "model": model,
         "prompt": text,
@@ -458,6 +488,24 @@ def scan_entry_completeness(client, collection: str, id_key: str,
     return incomplete, set(have)
 
 
+def ollama_preflight(ollama_url: str, timeout: int = 5) -> "str | None":
+    """None when Ollama answers; otherwise a one-line actionable message.
+
+    Without this the ingest treats "the backend is down" as "these files cannot embed":
+    every chunk fails, every heal candidate takes a strike, and three ordinary outages
+    retire the whole backlog permanently. It also stops a doomed run from sleeping
+    through its retry budget — 21k chunks x the retry delay is hours of a detached
+    background process achieving nothing.
+    """
+    try:
+        import requests
+        requests.get(f"{ollama_url}/api/tags", timeout=timeout).raise_for_status()
+        return None
+    except Exception as e:
+        return (f"Ollama is not reachable at {ollama_url} ({type(e).__name__}). "
+                f"Start it (`ollama serve`) and re-run; nothing was changed.")
+
+
 def _heal_state_path(root: Path, collection: str) -> Path:
     return Path(root) / ".sumela" / f".heal-state-{collection}.json"
 
@@ -490,8 +538,17 @@ def apply_heal_outcome(state: dict, attempted, failed) -> dict:
     HEAL_MAX_ATTEMPTS it stops being retried — without this an entry that can never
     embed would be retried on every pull forever, invisibly, which is its own silent
     failure. The retirement is reported once by the caller rather than swallowed.
+
+    A round where EVERYTHING failed records nothing. That shape is evidence about the
+    backend, not about the files: a stopped Ollama, a full disk, a wedged Qdrant. Left
+    unguarded it strikes out the entire backlog in three rounds and permanently disables
+    the healer for exactly the files it exists to repair — trading a silent hole for a
+    silent, permanent shutdown. A genuinely unembeddable file still accumulates strikes
+    because its neighbours in the same round succeed.
     """
-    failed = set(failed)
+    attempted, failed = set(attempted), set(failed)
+    if attempted and failed >= attempted:
+        return state
     for ident in attempted:
         if ident in failed:
             state[ident] = state.get(ident, 0) + 1

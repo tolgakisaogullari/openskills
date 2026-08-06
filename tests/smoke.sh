@@ -153,6 +153,18 @@ else bad "heal should be due once the interval has elapsed"; fi
 echo "not-a-number" >"$HEALDIR/.sumela/.heal-last"
 if _sumela_heal_due "$HEALDIR"; then ok "corrupt marker fails OPEN (heals rather than stalls)"
 else bad "corrupt marker must not disable healing"; fi
+# A non-numeric interval must not print "integer expression expected" into every git
+# command, nor silently disable healing by returning 2.
+HEAL_ERR="$(SUMELA_HEAL_INTERVAL_SECONDS=6h _sumela_heal_due "$HEALDIR" 2>&1)"
+if [ -z "$HEAL_ERR" ]; then ok "non-numeric interval produces no shell error"
+else bad "non-numeric interval leaked to stderr: $HEAL_ERR"; fi
+# An unwritable marker must stay SILENT (the redirect, not just the command, has to be
+# suppressed) and must REPORT failure so the caller can drop an unthrottleable heal.
+MARK_ERR="$(_sumela_heal_mark "$WORK/definitely/not/here" 2>&1)"; MARK_RC=$?
+if [ -z "$MARK_ERR" ]; then ok "unwritable marker prints nothing to the terminal"
+else bad "unwritable marker leaked to stderr: $MARK_ERR"; fi
+if [ "$MARK_RC" -ne 0 ]; then ok "unwritable marker reports failure (heal is dropped, not unthrottled)"
+else bad "unwritable marker must return non-zero"; fi
 
 if command -v python3 >/dev/null 2>&1; then
   :

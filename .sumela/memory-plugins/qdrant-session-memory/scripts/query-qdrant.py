@@ -35,9 +35,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.memory_ingest import (
     resolve_collection_arg, COLLECTION_BASES, qdrant_client_preflight,
-    # Shared with the ingest paths so a long QUERY is bounded too — this path embeds
-    # caller-supplied text and would otherwise kill the runner exactly like an
-    # oversized ingest chunk.
+    # Shared with the ingest paths. get_embedding enforces the length bound itself, so
+    # this path — which embeds raw caller-supplied query text and never chunks it — is
+    # covered without having to remember to chunk first.
     get_embedding,
 )
 

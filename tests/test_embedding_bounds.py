@@ -97,6 +97,28 @@ def main():
               estimate_tokens("x" * chars) >= tokens)
     check("empty text needs no split", estimate_tokens("") <= limit)
 
+    # --- the bound must count BYTES, not codepoints ---------------------------------
+    # This is the assertion whose absence hid a live defect: the original bound used
+    # len(text), and an ASCII-only test suite could never notice. Qwen uses byte-level
+    # BPE, so a token covers at least one BYTE — measured at the old 7372-codepoint
+    # limit, Cyrillic reached 14,740 bytes and common CJK 22,110, and the CJK chunk
+    # returned HTTP 500 while the estimate still read 7372.
+    for label, sample in (("Cyrillic", "д"), ("CJK", "字"),
+                          ("emoji", "\U0001F600"), ("CJK Ext-B", "\U00020000")):
+        text = sample * 3000
+        check(f"{label} is bounded by bytes, not codepoints",
+              estimate_tokens(text) >= len(text.encode("utf-8")))
+        check(f"{label} chunks all fit the byte budget",
+              all(len(c.encode("utf-8")) + 2 <= limit for c in chunk_text(text)))
+    mixed = "ascii " + "字" * 5000 + " \U0001F600" * 500
+    check("mixed-script text is bounded",
+          all(len(c.encode("utf-8")) + 2 <= limit for c in chunk_text(mixed)))
+    check("splitting never breaks a codepoint (round-trip is exact)",
+          "".join(chunk_text(mixed)) == mixed)
+    for c in chunk_text("字" * 5000):
+        c.encode("utf-8").decode("utf-8")   # raises if a codepoint was cut in half
+    check("every emitted chunk is valid UTF-8", True)
+
     # --- chunk_text: every emitted chunk is bounded --------------------------------
     prose = " ".join(f"kelime{i}" for i in range(5000))
     chunks = chunk_text(prose)
@@ -209,6 +231,30 @@ def main():
           state["bad.cs"] >= _mod.HEAL_MAX_ATTEMPTS)
     state = _mod.apply_heal_outcome(state, {"bad.cs"}, set())
     check("a later success clears the strikes", "bad.cs" not in state)
+
+    # A round where EVERYTHING failed is evidence about the backend, not the files.
+    # Recording strikes there retires the whole backlog after three outages and
+    # permanently disables the healer — a silent shutdown replacing a silent hole.
+    state = {}
+    for _ in range(_mod.HEAL_MAX_ATTEMPTS + 2):
+        state = _mod.apply_heal_outcome(state, {"a.cs", "b.cs", "c.cs"}, {"a.cs", "b.cs", "c.cs"})
+    check("a total outage records NO strikes", state == {})
+    state = _mod.apply_heal_outcome(state, {"a.cs", "b.cs"}, {"a.cs"})
+    check("a partial failure still strikes the failing entry", state.get("a.cs") == 1)
+    check("a partial failure clears the succeeding entry", "b.cs" not in state)
+
+    # --- get_embedding enforces the bound itself ------------------------------------
+    # The bound used to live only in chunk_text, so any caller that did not chunk
+    # first silently opted out — query-qdrant.py embeds raw user text and did exactly
+    # that. Truncation is the right degradation for a query; ingest already pre-splits.
+    calls = install_fake_requests([_FakeResponse({"embedding": [0.9]})])
+    huge = "字" * (limit * 2)
+    get_embedding(huge, "http://localhost:11434")
+    sent = calls[0]["json"]["prompt"]
+    check("an oversized input is truncated before it reaches Ollama", len(sent) < len(huge))
+    check("the truncated payload fits the byte budget",
+          len(sent.encode("utf-8")) + 2 <= limit)
+    sys.modules.pop("requests", None)
 
     if check.failed:
         print(f"\n{check.failed} assertion(s) FAILED")

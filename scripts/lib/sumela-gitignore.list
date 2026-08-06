@@ -11,6 +11,7 @@
 .sumela/.retrieval-cache.json
 .sumela/.heal-last
 .sumela/.heal-state-*.json
+.sumela/.ingest.lock/
 .superpowers/
 **/scripts/.superpowers/
 graphify-out/
