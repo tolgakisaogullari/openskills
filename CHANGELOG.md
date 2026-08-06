@@ -118,13 +118,16 @@ check can detect a newer upstream via `git ls-remote --tags`.
   sails past any word budget. Four independent defects, all fixed:
   - `get_embedding` now sends `options.num_batch` (default 8192, `SUMELA_EMBED_NUM_BATCH`)
     — verified A/B, same input `500` → `200`.
-  - `chunk_text` now hard-bounds every emitted chunk, splitting by characters when words
-    cannot. The bound is `chars + 2`, which is **provable** rather than measured (a BPE
-    token always covers ≥1 char): measured chars/token runs 3.21 for Turkish prose down
-    to **1.00 for digit-heavy text, where 3054 chars produced 3055 tokens** — so every
-    ratio-based estimate tuned on prose under-counts digits, and under-counting is what
-    kills the runner. The token budget is **derived** from `num_batch` (90%) instead of
-    configured beside it, so lowering one cannot silently invalidate the other.
+  - `chunk_text` now hard-bounds every emitted chunk, splitting on a **UTF-8 byte**
+    budget when words cannot. The bound is `bytes + 2`, provable because byte-level BPE
+    (what Qwen uses) never emits a token covering less than one byte. A character-based
+    bound was tried first and **shipped broken through two commits**: it under-counts
+    every multi-byte script by up to 4x, and a review reproduced live 500s on ordinary
+    CJK — which is the worst case in practice because CJK has no word spaces, so a
+    paragraph collapses to one "word" and always takes the split path. The ASCII-only
+    regression test could not see it. The token budget is **derived** from `num_batch`
+    (90%) instead of configured beside it, so lowering one cannot silently invalidate
+    the other, and the split accumulates whole characters so a codepoint is never cut.
   - `get_embedding` retries once: a neighbour killed as collateral damage succeeds on the
     second attempt after Ollama restarts the runner.
   - **Ingest is now all-or-nothing per file/page.** Previously a failed chunk was skipped
@@ -176,8 +179,11 @@ check can detect a newer upstream via `git ls-remote --tags`.
     all-or-nothing already makes it self-correcting.
 
   Measured on a 15.5k-file repo: detection is **0.11 s** (payload-only scroll over 21k
-  points) plus **~1.0 s** for the source walk; the first heal there had 404 entries to
-  repair (334 partial, 70 absent). New per-developer state (`.sumela/.heal-last`,
+  points) plus **0.33 s** for the source walk; the first heal there had 404 entries to
+  repair (334 partial, 70 absent). `full_walk` was rewritten for this — it ran one
+  `rglob` per pattern (nine passes) and descended `node_modules/`, `bin/` and `obj/` in
+  every one, costing **6.3 s**; pruning excluded directories during a single `os.walk`
+  gives an identical file set 19x faster, which is what makes a scheduled heal viable. New per-developer state (`.sumela/.heal-last`,
   `.sumela/.heal-state-*.json`) is added to `scripts/lib/sumela-gitignore.list`, the
   single source both setup and update reconcile from, so it reaches upgraded installs too.
 

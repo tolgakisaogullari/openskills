@@ -10,7 +10,8 @@ What it does:
        (EXTRA_INGEST_DIRS env / .sumela/ingest.conf, default none) — for .md files
        (excluding special files), symlink-safe and deduped by resolved path.
     2. Parses YAML frontmatter (type, tags, date_updated).
-    3. Chunks body via naive word-level split (512 tokens, 50 overlap).
+    3. Chunks body by WORDS (512, 50 overlap), then hard-bounds each chunk by TOKENS —
+       the two differ by up to 4x, see lib.memory_ingest.
     4. Generates embeddings via Ollama (qwen3-embedding:0.6b) in parallel.
     5. Deletes existing points for the page (idempotency) and upserts new chunks
        into Qdrant 'wiki_pages' collection with structured payload.
@@ -98,8 +99,6 @@ QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 # resolver). PROJECT_SLUG namespaces the payload and point IDs (see ingest-code).
 COLLECTION_NAME = resolve_collection_arg("wiki_pages")
 PROJECT_SLUG = project_slug()
-CHUNK_SIZE = 512
-OVERLAP = 50
 MAX_WORKERS = EMBED_MAX_WORKERS      # measured default + env override — see lib.memory_ingest
 
 REPO_ROOT = get_repo_root()
@@ -234,7 +233,7 @@ def main():
             content = f.read()
 
         fm, body = extract_frontmatter(content)
-        chunks = chunk_text(body, CHUNK_SIZE, OVERLAP)
+        chunks = chunk_text(body)
         if not chunks:
             continue
 
@@ -343,9 +342,11 @@ def main():
 
     qdrant_ok = total_chunks > 0
     report_success(pages_ingested, total_chunks, qdrant_ok, len(failed_pages), len(upsert_failed))
-    # Non-zero when pages were skipped or lost their points: the index was not fully
-    # refreshed and the caller must not read "SUCCESS" and move on.
-    sys.exit(0 if qdrant_ok and not failed_pages and not upsert_failed else 1)
+    # 0 = fully refreshed · 2 = ran, some pages stale · 1 = could not run.
+    # See the code-ingest twin for why 2 is separate from 1.
+    if not qdrant_ok:
+        sys.exit(1)
+    sys.exit(2 if (failed_pages or upsert_failed) else 0)
 
 
 if __name__ == "__main__":

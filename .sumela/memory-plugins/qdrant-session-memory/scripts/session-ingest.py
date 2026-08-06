@@ -244,6 +244,12 @@ def main():
     affected_files = extract_affected_files(text)
 
     chunks = chunk_text(text)
+    if not chunks:
+        # Bail BEFORE the delete below: an empty summary would otherwise wipe the prior
+        # session's points and upsert nothing in their place.
+        print("[session-ingest] Summary body is empty — nothing to ingest, index unchanged.")
+        report_success(session_id, 0, False, len(decisions), len(affected_files))
+        sys.exit(0)
     print(f"[session-ingest] Chunked into {len(chunks)} chunks.")
     print(f"[session-ingest] Decisions extracted: {len(decisions)}")
     print(f"[session-ingest] Affected files: {len(affected_files)}")

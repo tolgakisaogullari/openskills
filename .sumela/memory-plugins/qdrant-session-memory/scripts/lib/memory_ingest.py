@@ -313,9 +313,34 @@ def _warn(msg: str) -> None:
 # ceiling but leaves an unbounded chunk unbounded, and MAX_TOKENS bounds the input but
 # cannot help a caller that overrides it. Measured on qwen3-embedding:0.6b — 2048 is a
 # hard cliff (1970 tokens → 200, 2104 tokens → 500, deterministic when uncached).
+def _env_num(name: str, default, minimum, cast=int):
+    """Read a numeric env var, falling back loudly instead of exploding at import.
+
+    These are read at module scope, so an unparseable value would raise before any
+    script's error handling exists — a bare traceback from `git pull` on every hook.
+    The floor matters just as much: a negative EMBED_NUM_BATCH survived the old
+    `>=` clamp and drove the char-split budget to 1, i.e. a per-character embed storm
+    launched from a git hook.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        print(f"[warn] {name}={raw!r} is not a number; using {default}", file=sys.stderr)
+        return default
+    if value < minimum:
+        print(f"[warn] {name}={value} is below the {minimum} floor; using {minimum}",
+              file=sys.stderr)
+        return minimum
+    return value
+
+
 DEFAULT_EMBED_MODEL = "qwen3-embedding:0.6b"
-EMBED_NUM_BATCH = int(os.getenv("SUMELA_EMBED_NUM_BATCH", "8192"))
-EMBED_RETRY_DELAY_SECONDS = float(os.getenv("SUMELA_EMBED_RETRY_DELAY", "2"))
+EMBED_DIM = 1024                      # qwen3-embedding:0.6b — pinned so a bad response is caught
+EMBED_NUM_BATCH = _env_num("SUMELA_EMBED_NUM_BATCH", 8192, 512)
+EMBED_RETRY_DELAY_SECONDS = _env_num("SUMELA_EMBED_RETRY_DELAY", 2.0, 0.0, float)
 
 # Concurrent embed requests during a bulk ingest. 4 is measured, not assumed: on 60 real
 # code chunks (~2.6 KB each) throughput ran 12.3 chunk/s at 1 worker, 21.1 at 2, 24.3 at
@@ -323,13 +348,17 @@ EMBED_RETRY_DELAY_SECONDS = float(os.getenv("SUMELA_EMBED_RETRY_DELAY", "2"))
 # OLLAMA_NUM_PARALLEL=1 (a single runner slot) because it is PIPELINING, not parallel
 # compute: the next requests are already queued at the server, keeping the HTTP round
 # trip and client overhead off the critical path. Lower it on a memory-constrained host.
-EMBED_MAX_WORKERS = max(1, int(os.getenv("SUMELA_EMBED_MAX_WORKERS", "4")))
+EMBED_MAX_WORKERS = _env_num("SUMELA_EMBED_MAX_WORKERS", 4, 1)
+
+# Word budget per chunk, shared so the two ingest scripts and chunk_text cannot drift.
+EMBED_CHUNK_WORDS = 512
+EMBED_CHUNK_OVERLAP = 50
 
 # The token budget is DERIVED from the batch size rather than configured beside it.
 # Two independently-set numbers carrying an invariant ("budget < batch") drift the day
 # somebody lowers one of them, and the symptom — a dead runner — surfaces nowhere near
 # the config change. 90% leaves room for the special tokens the server appends.
-EMBED_MAX_TOKENS = int(os.getenv("SUMELA_EMBED_MAX_TOKENS", str(EMBED_NUM_BATCH * 9 // 10)))
+EMBED_MAX_TOKENS = _env_num("SUMELA_EMBED_MAX_TOKENS", EMBED_NUM_BATCH * 9 // 10, 64)
 if EMBED_MAX_TOKENS >= EMBED_NUM_BATCH:
     print(f"[warn] SUMELA_EMBED_MAX_TOKENS ({EMBED_MAX_TOKENS}) must stay below "
           f"SUMELA_EMBED_NUM_BATCH ({EMBED_NUM_BATCH}); clamping.", file=sys.stderr)
@@ -383,16 +412,19 @@ def _split_oversized(chunk: str, max_tokens: int) -> List[str]:
     return out
 
 
-def chunk_text(text: str, size: int = 512, overlap: int = 50,
-               max_tokens: int = None) -> List[str]:
+def chunk_text(text: str, size: int = EMBED_CHUNK_WORDS,
+               overlap: int = EMBED_CHUNK_OVERLAP) -> List[str]:
     """Split text into overlapping chunks of `size` WORDS, then hard-bound each chunk.
 
-    `size` is a word budget, not a token budget — the two differ by 2-7x depending on
-    content, which is why the token bound below exists rather than a smaller `size`.
+    `size` is a word budget, not a token budget — the two differ by up to 4x depending
+    on content and script, which is why the token bound exists rather than a smaller
+    `size`. The token budget is deliberately NOT a parameter: a caller able to raise it
+    could hand the runner a prompt that kills it, and the one thing this module must
+    guarantee is that it never emits such a chunk.
     """
     if not text.strip():
         return []
-    max_tokens = EMBED_MAX_TOKENS if max_tokens is None else max_tokens
+    max_tokens = EMBED_MAX_TOKENS
     words = text.split()
     if len(words) <= size:
         raw = [text]
@@ -435,11 +467,17 @@ def get_embedding(text: str, ollama_url: str, model: str = DEFAULT_EMBED_MODEL,
         "options": {"num_batch": EMBED_NUM_BATCH},
     }
     last_error = None
-    for attempt in range(retries + 1):
+    for attempt in range(max(1, retries + 1)):   # a negative `retries` must not skip the loop
         try:
             resp = requests.post(f"{ollama_url}/api/embeddings", json=payload, timeout=timeout)
             resp.raise_for_status()
-            return resp.json()["embedding"]
+            vector = resp.json().get("embedding") or []
+            # Ollama answers 200 with an empty array on some soft failures. Unchecked,
+            # that reaches PointStruct and fails the whole file's upsert AFTER its old
+            # points were deleted — a hole created by a "successful" embed.
+            if len(vector) != EMBED_DIM:
+                raise ValueError(f"embedding has {len(vector)} dims, expected {EMBED_DIM}")
+            return vector
         except Exception as e:      # noqa: BLE001 — re-raised below once retries are spent
             last_error = e
             if attempt < retries:
@@ -458,7 +496,7 @@ HEAL_MAX_ATTEMPTS = int(os.getenv("SUMELA_HEAL_MAX_ATTEMPTS", "3"))
 
 
 def scan_entry_completeness(client, collection: str, id_key: str,
-                            page: int = 4000) -> "tuple[set, set]":
+                            page: int = 4000, project: str = None) -> "tuple[set, set]":
     """Return (incomplete, known) identities for `collection`.
 
     `incomplete` = entries whose stored point count is below their own `total_chunks`;
@@ -468,11 +506,22 @@ def scan_entry_completeness(client, collection: str, id_key: str,
 
     Payload-only scroll — measured at 0.11 s over 21k points / 15.5k files, cheap enough
     to run on every pull.
+
+    `project` scopes the scan to one project_slug. Collections are namespaced per project
+    by default, but the CODE_CHUNKS_COLLECTION override deliberately lets two repos share
+    one — and there an unscoped scan reads the OTHER project's paths as "known", so this
+    project's real gaps are never healed.
     """
     have, total, offset = {}, {}, None
+    scan_filter = None
+    if project:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        scan_filter = Filter(must=[FieldCondition(key="project_slug",
+                                                  match=MatchValue(value=project))])
     while True:
         points, offset = client.scroll(
             collection_name=collection, limit=page, offset=offset,
+            scroll_filter=scan_filter,
             with_payload=[id_key, "total_chunks"], with_vectors=False,
         )
         for point in points:
@@ -507,7 +556,13 @@ def ollama_preflight(ollama_url: str, timeout: int = 5) -> "str | None":
 
 
 def _heal_state_path(root: Path, collection: str) -> Path:
-    return Path(root) / ".sumela" / f".heal-state-{collection}.json"
+    # A collection name is not a filesystem identifier: CODE_CHUNKS_COLLECTION is an
+    # operator-supplied override that reaches this unsanitized, and `../` in it would
+    # write outside .sumela/ AND escape the `.heal-state-*.json` gitignore pattern
+    # (which does not match across a slash). get_extra_ingest_dirs already validates
+    # this class of input; this meets the same bar.
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", collection) or "default"
+    return Path(root) / ".sumela" / f".heal-state-{safe}.json"
 
 
 def load_heal_state(root: Path, collection: str) -> dict:
@@ -520,13 +575,24 @@ def load_heal_state(root: Path, collection: str) -> dict:
         return {}
 
 
-def save_heal_state(root: Path, collection: str, state: dict) -> None:
-    """Best-effort persist; a read-only or missing .sumela dir is not worth failing over."""
+def save_heal_state(root: Path, collection: str, state: dict, keep=None) -> None:
+    """Best-effort persist; a read-only or missing .sumela dir is not worth failing over.
+
+    `keep` bounds the file: strikes for entries no longer under consideration (deleted
+    files) would otherwise accumulate forever, since apply_heal_outcome only ever touches
+    what was attempted. Writes via a temp file + os.replace so a concurrent ingest or a
+    crash cannot leave truncated JSON — load_heal_state swallows a parse error and
+    returns {}, which would silently reset every strike.
+    """
     try:
         import json
+        if keep is not None:
+            state = {k: v for k, v in state.items() if k in set(keep)}
         path = _heal_state_path(root, collection)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=0, sort_keys=True), encoding="utf-8")
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=0, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
     except Exception:
         pass
 

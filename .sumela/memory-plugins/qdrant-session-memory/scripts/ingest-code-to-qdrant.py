@@ -10,6 +10,11 @@ Usage:
     # path per line). Used by the pull-time hook so code search stays fresh cheaply:
     python ...ingest-code-to-qdrant.py --changed-file /tmp/changed.txt
 
+    # HEAL — re-ingest entries the index is missing or only partially holds. The git
+    # hook passes this on a schedule; run it by hand if you suspect the index is
+    # incomplete. Combines with --changed-file into a single run:
+    python ...ingest-code-to-qdrant.py --heal
+
 What it does:
     1. Selects code files (.cs, .ts, .tsx, .py, .go, .rs, .java, .js, .jsx):
          * FULL        — walks src/ recursively.
@@ -19,7 +24,8 @@ What it does:
     3. Ensures the 'code_chunks' collection exists (creates it if missing). On an
        EMPTY/just-created collection an incremental run is promoted to a FULL walk,
        so the first pull after setup builds the whole corpus.
-    4. Reads file contents and chunks if > 512 tokens.
+    4. Reads file contents and chunks by WORDS (512, 50 overlap), then hard-bounds each
+       chunk by TOKENS — the two differ by up to 4x, see lib.memory_ingest.
     5. Generates embeddings via Ollama (qwen3-embedding:0.6b) in parallel.
     6. Deletes existing points for the file (idempotency) and upserts new chunks
        into Qdrant 'code_chunks' collection with structured payload.
@@ -39,6 +45,12 @@ Environment:
     CODE_CHUNKS_COLLECTION defaults to code_chunks
     SRC_DIR defaults to src (relative to repo root)
     CODE_PATTERNS defaults to *.cs,*.ts,*.tsx,*.py,*.go,*.rs,*.java,*.js,*.jsx
+    SUMELA_EMBED_NUM_BATCH / _MAX_TOKENS / _MAX_WORKERS / _RETRY_DELAY — see
+      lib.memory_ingest and the plugin README's Configuration table
+    SUMELA_HEAL_MAX_ATTEMPTS defaults to 3 (failed heals before an entry is retired)
+
+Exit codes: 0 = index fully refreshed · 2 = ran, some entries left stale (re-run) ·
+1 = could not run (Qdrant/Ollama unreachable).
 """
 import sys, os, fnmatch, argparse
 from pathlib import Path
@@ -50,7 +62,7 @@ from lib.memory_ingest import (
     get_repo_root, chunk_text, get_embedding, deterministic_id, print_report,
     resolve_collection_arg, project_slug, qdrant_client_preflight, EMBED_MAX_WORKERS,
     scan_entry_completeness, load_heal_state, save_heal_state, apply_heal_outcome,
-    HEAL_MAX_ATTEMPTS, ollama_preflight,
+    HEAL_MAX_ATTEMPTS, ollama_preflight, EMBED_DIM,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -107,13 +119,11 @@ QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 # projects sharing one Qdrant instance never overwrite each other's points.
 COLLECTION_NAME = resolve_collection_arg("code_chunks")
 PROJECT_SLUG = project_slug()
-CHUNK_SIZE = 512
-OVERLAP = 50
 MAX_WORKERS = EMBED_MAX_WORKERS      # measured default + env override — see lib.memory_ingest
 
-# MUST stay in sync with setup-qdrant.py (same collection, same vector geometry) —
-# a mismatch makes upserts fail with a dimension error.
-EMBED_DIM = 1024              # Qwen3-Embedding-0.6B
+# Vector geometry MUST match setup-qdrant.py (same collection) — a mismatch makes
+# upserts fail with a dimension error. EMBED_DIM comes from lib so the ingest, the
+# response validation in get_embedding, and this collection definition cannot drift.
 DISTANCE = Distance.COSINE
 
 REPO_ROOT = get_repo_root()
@@ -206,9 +216,20 @@ def ensure_collection(client: QdrantClient) -> bool:
 
 
 def full_walk() -> List[Path]:
+    """Every ingestable code file under SRC_DIR, in one pass.
+
+    Prunes excluded directories DURING the walk rather than filtering afterwards: the
+    previous form ran one `rglob` per pattern (nine passes) and descended `node_modules/`,
+    `bin/`, `obj/` and `.venv/` in every one of them. That was tolerable when a full walk
+    only happened on an explicit rebuild; the healer now runs it on a schedule, so on a
+    JS monorepo it would have been tens of seconds of disk I/O per heal.
+    """
     code_files: List[Path] = []
-    for pattern in CODE_PATTERNS:
-        code_files.extend(SRC_DIR.rglob(pattern))
+    for dirpath, dirnames, filenames in os.walk(SRC_DIR):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS]
+        for name in filenames:
+            if _matches_code_pattern(name):
+                code_files.append(Path(dirpath) / name)
     return sorted(set(code_files))
 
 
@@ -253,7 +274,8 @@ def heal_select(client) -> "tuple[List[Path], int]":
     HEAL_MAX_ATTEMPTS are retired from the rotation so a permanently-unembeddable file
     cannot spin on every pull forever.
     """
-    incomplete, known = scan_entry_completeness(client, COLLECTION_NAME, "file_path")
+    incomplete, known = scan_entry_completeness(client, COLLECTION_NAME, "file_path",
+                                                project=PROJECT_SLUG)
     on_disk = {}
     for path in full_walk():
         if not should_skip_file(path):
@@ -363,7 +385,7 @@ def main():
         if not content.strip():
             continue
 
-        chunks = chunk_text(content, CHUNK_SIZE, OVERLAP)
+        chunks = chunk_text(content)
         if not chunks:
             continue
 
@@ -378,7 +400,8 @@ def main():
             attempted = {p.relative_to(REPO_ROOT).as_posix() for p in heal_paths}
             save_heal_state(REPO_ROOT, COLLECTION_NAME,
                             apply_heal_outcome(load_heal_state(REPO_ROOT, COLLECTION_NAME),
-                                               attempted, attempted))
+                                               attempted, attempted),
+                            keep=attempted)
         report_success(0, 0, True, mode)
         sys.exit(0)
 
@@ -441,9 +464,14 @@ def main():
         try:
             client.delete(
                 collection_name=COLLECTION_NAME,
-                points_selector=Filter(
-                    must=[FieldCondition(key="file_path", match=MatchValue(value=rel_path))]
-                ),
+                # project_slug is part of the selector, not just the payload: under the
+                # CODE_CHUNKS_COLLECTION override two repos share a collection, and a
+                # path-only filter would delete the OTHER project's identically-named
+                # file. Cheap to scope, expensive to discover.
+                points_selector=Filter(must=[
+                    FieldCondition(key="file_path", match=MatchValue(value=rel_path)),
+                    FieldCondition(key="project_slug", match=MatchValue(value=PROJECT_SLUG)),
+                ]),
             )
         except Exception as e:
             print(f"[warn] delete failed for {rel_path}: {e}")
@@ -486,17 +514,25 @@ def main():
         # or filtered). All three would otherwise be re-detected on every single pull;
         # the strike counter retires them instead of churning forever.
         attempted = {p.relative_to(REPO_ROOT).as_posix() for p in heal_paths}
+        # keep= bounds the file to what is still a candidate; strikes for files since
+        # deleted from disk would otherwise accumulate forever.
         save_heal_state(REPO_ROOT, COLLECTION_NAME,
                         apply_heal_outcome(load_heal_state(REPO_ROOT, COLLECTION_NAME),
-                                           attempted, attempted - upserted_ok))
+                                           attempted, attempted - upserted_ok),
+                        keep=attempted)
 
     qdrant_ok = total_chunks > 0
     report_success(files_ingested, total_chunks, qdrant_ok, mode,
                    len(failed_files), len(upsert_failed))
-    # A run that skipped files or lost points to a failed upsert did NOT fully refresh
-    # the index — exit non-zero so a caller (hook, CI, operator) sees it rather than
-    # reading "SUCCESS" and moving on.
-    sys.exit(0 if qdrant_ok and not failed_files and not upsert_failed else 1)
+    # Exit space is three-valued on purpose. Collapsing "ran, but N entries are stale"
+    # into the same 1 as "could not run at all" made setup-memory.sh tell the operator
+    # seeding was skipped when 99 of 100 files had in fact landed.
+    #   0 = index fully refreshed
+    #   2 = ran, but some entries are NOT up to date (re-run to finish)
+    #   1 = could not run / nothing ingested
+    if not qdrant_ok:
+        sys.exit(1)
+    sys.exit(2 if (failed_files or upsert_failed) else 0)
 
 
 if __name__ == "__main__":

@@ -138,6 +138,9 @@ fi
 # rate-limited (no process per commit) yet ALWAYS due on a fresh install — that is what
 # makes an upgrade repair the previous version's damage with nothing to run by hand.
 HEALDIR="$WORK/healcheck"; mkdir -p "$HEALDIR/.sumela"
+# Pin the interval explicitly: a developer with this exported would otherwise
+# flip the "throttled" and "due again" assertions below.
+SUMELA_HEAL_INTERVAL_SECONDS=21600
 sed -n '/^_sumela_heal_due()/,/^}/p;/^_sumela_heal_mark()/,/^}/p' \
   "$REPO_ROOT/.sumela/git-hooks/_lib.sh" >"$WORK/heal_fns.sh"
 # shellcheck source=/dev/null
@@ -166,11 +169,7 @@ else bad "unwritable marker leaked to stderr: $MARK_ERR"; fi
 if [ "$MARK_RC" -ne 0 ]; then ok "unwritable marker reports failure (heal is dropped, not unthrottled)"
 else bad "unwritable marker must return non-zero"; fi
 
-if command -v python3 >/dev/null 2>&1; then
-  :
-else
-  echo "  SKIP  get_repo_root + extra-ingest + embedding-bounds unit tests (python3 unavailable)"
-fi
+
 
 echo ""
 echo "Run 2 — idempotency (re-run must not duplicate)"

@@ -147,9 +147,10 @@ def main():
     # --- get_embedding: num_batch is actually sent ---------------------------------
     # Raising the ceiling is half the fix; without this assertion a refactor could drop
     # the option and every symptom would return with the suite still green.
-    calls = install_fake_requests([_FakeResponse({"embedding": [0.1, 0.2]})])
+    DIM = _mod.EMBED_DIM
+    calls = install_fake_requests([_FakeResponse({"embedding": [0.1] * DIM})])
     vec = get_embedding("merhaba", "http://localhost:11434")
-    check("embedding vector is returned", vec == [0.1, 0.2])
+    check("embedding vector is returned", vec == [0.1] * DIM)
     check("request carries options.num_batch",
           calls[0]["json"].get("options", {}).get("num_batch") == _mod.EMBED_NUM_BATCH)
     check("num_batch clears the 2048 default that crashes the runner",
@@ -167,10 +168,10 @@ def main():
     _mod.EMBED_RETRY_DELAY_SECONDS = 0      # keep the test fast
     calls = install_fake_requests([
         RuntimeError("500 Server Error: Internal Server Error"),
-        _FakeResponse({"embedding": [0.3]}),
+        _FakeResponse({"embedding": [0.3] * _mod.EMBED_DIM}),
     ])
     check("transient failure is retried and succeeds",
-          get_embedding("merhaba", "http://localhost:11434") == [0.3])
+          get_embedding("merhaba", "http://localhost:11434") == [0.3] * _mod.EMBED_DIM)
     check("retry issued exactly two requests", len(calls) == 2)
 
     calls = install_fake_requests([
@@ -199,8 +200,11 @@ def main():
         """Two-page scroll, so paging is exercised rather than assumed."""
         def __init__(self, points):
             self.pages = [points[:len(points) // 2], points[len(points) // 2:]]
+            self.filters = []
 
-        def scroll(self, collection_name, limit, offset, with_payload, with_vectors):
+        def scroll(self, collection_name, limit, offset, with_payload, with_vectors,
+                   scroll_filter=None):
+            self.filters.append(scroll_filter)
             idx = offset or 0
             return self.pages[idx], (1 if idx == 0 else None)
 
@@ -210,7 +214,15 @@ def main():
     points.append(_Point({"file_path": "partial.cs", "total_chunks": 4}))       # 1 of 4
     points.append(_Point({"file_path": "single.cs", "total_chunks": 1}))
     points.append(_Point({"total_chunks": 2}))                                  # no identity
-    incomplete, known = _mod.scan_entry_completeness(_FakeClient(points), "code_chunks", "file_path")
+    fake = _FakeClient(points)
+    incomplete, known = _mod.scan_entry_completeness(fake, "code_chunks", "file_path")
+    check("an unscoped scan sends no filter", all(f is None for f in fake.filters))
+    # Under the shared-collection override two repos live in one collection; an unscoped
+    # scan would read the other project's paths as "known" and never heal this one's gaps.
+    scoped = _FakeClient(points)
+    _mod.scan_entry_completeness(scoped, "code_chunks", "file_path", project="proj-a")
+    check("a project-scoped scan filters on project_slug",
+          all(f is not None for f in scoped.filters))
     check("partial entry is detected", incomplete == {"partial.cs"})
     check("complete entries are not flagged", "complete.cs" not in incomplete)
     check("single-chunk entry is not flagged", "single.cs" not in incomplete)
@@ -247,7 +259,7 @@ def main():
     # The bound used to live only in chunk_text, so any caller that did not chunk
     # first silently opted out — query-qdrant.py embeds raw user text and did exactly
     # that. Truncation is the right degradation for a query; ingest already pre-splits.
-    calls = install_fake_requests([_FakeResponse({"embedding": [0.9]})])
+    calls = install_fake_requests([_FakeResponse({"embedding": [0.9] * _mod.EMBED_DIM})])
     huge = "字" * (limit * 2)
     get_embedding(huge, "http://localhost:11434")
     sent = calls[0]["json"]["prompt"]

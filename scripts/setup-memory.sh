@@ -171,7 +171,17 @@ if want qdrant-session-memory && [ -d "$PLUGDIR/qdrant-session-memory" ]; then
     extra_dirs=""
     [ -f "$s/resolve-ingest-dirs.py" ] && extra_dirs="$(python3 "$s/resolve-ingest-dirs.py" 2>/dev/null)"
     if [ -f "$s/ingest-wiki-to-qdrant.py" ] && { [ -d "docs/second-brain/wiki" ] || [ -n "$extra_dirs" ]; }; then
-      python3 "$s/ingest-wiki-to-qdrant.py" >/dev/null 2>&1 && ok "Seeded wiki_pages" || info "wiki_pages seeding skipped (will sync on pull)"
+      # Three-valued exit: 0 seeded, 2 seeded with stale pages, 1 could not run.
+      # Collapsing 2 into the failure branch used to claim seeding was "skipped" when
+      # nearly everything had landed — and "will sync on pull" is false for the pages
+      # that actually failed, since the wiki sync only fires when a .md changes.
+      wiki_log="$(python3 "$s/ingest-wiki-to-qdrant.py" 2>&1)"; wiki_rc=$?
+      case "$wiki_rc" in
+        0) ok "Seeded wiki_pages" ;;
+        2) info "Seeded wiki_pages, but some pages were skipped — re-run to finish: python3 $s/ingest-wiki-to-qdrant.py"
+           printf '%s\n' "$wiki_log" | grep -E '^\[warn\]' | head -5 ;;
+        *) info "wiki_pages seeding skipped (will sync on pull)" ;;
+      esac
     fi
     info "code_chunks left empty — built automatically on the next pull that touches code (or run now: python3 $s/ingest-code-to-qdrant.py)"
   fi
