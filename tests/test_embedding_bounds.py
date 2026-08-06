@@ -166,6 +166,50 @@ def main():
 
     sys.modules.pop("requests", None)
 
+    # --- self-heal: incomplete entries are self-identifying -------------------------
+    # The whole automatic-repair story rests on this: every point carries total_chunks,
+    # so a half-written entry can be found without any bookkeeping elsewhere.
+    class _Point:
+        def __init__(self, payload):
+            self.payload = payload
+
+    class _FakeClient:
+        """Two-page scroll, so paging is exercised rather than assumed."""
+        def __init__(self, points):
+            self.pages = [points[:len(points) // 2], points[len(points) // 2:]]
+
+        def scroll(self, collection_name, limit, offset, with_payload, with_vectors):
+            idx = offset or 0
+            return self.pages[idx], (1 if idx == 0 else None)
+
+    points = []
+    for i in range(3):
+        points.append(_Point({"file_path": "complete.cs", "total_chunks": 3}))
+    points.append(_Point({"file_path": "partial.cs", "total_chunks": 4}))       # 1 of 4
+    points.append(_Point({"file_path": "single.cs", "total_chunks": 1}))
+    points.append(_Point({"total_chunks": 2}))                                  # no identity
+    incomplete, known = _mod.scan_entry_completeness(_FakeClient(points), "code_chunks", "file_path")
+    check("partial entry is detected", incomplete == {"partial.cs"})
+    check("complete entries are not flagged", "complete.cs" not in incomplete)
+    check("single-chunk entry is not flagged", "single.cs" not in incomplete)
+    check("known set covers every identity seen",
+          known == {"complete.cs", "partial.cs", "single.cs"})
+    check("payload without an identity key is ignored", None not in known)
+
+    # --- self-heal: the strike counter retires a hopeless entry ---------------------
+    # Without this an entry that can never embed is retried on every pull forever —
+    # a silent loop replacing a silent hole.
+    state = {}
+    for _ in range(_mod.HEAL_MAX_ATTEMPTS):
+        state = _mod.apply_heal_outcome(state, {"bad.cs", "good.cs"}, {"bad.cs"})
+    check("repeated failure accumulates strikes",
+          state.get("bad.cs") == _mod.HEAL_MAX_ATTEMPTS)
+    check("an entry that heals is forgotten", "good.cs" not in state)
+    check("strikes reach the retirement threshold",
+          state["bad.cs"] >= _mod.HEAL_MAX_ATTEMPTS)
+    state = _mod.apply_heal_outcome(state, {"bad.cs"}, set())
+    check("a later success clears the strikes", "bad.cs" not in state)
+
     if check.failed:
         print(f"\n{check.failed} assertion(s) FAILED")
         sys.exit(1)

@@ -434,6 +434,28 @@ sumela_wiki_sync() {  # $1 = "from" ref, $2 = "to" ref
 #     promotes the run to a FULL tree build so the whole corpus gets indexed once.
 #   SUMELA_PULL_CODE_REINGEST=1 forces a FULL tree re-embed instead of incremental.
 #   Disable everything (no prune, no embed): SUMELA_DISABLE_CODE_SYNC=1
+# Is a self-heal pass due? The healer is cheap (a payload-only scroll plus a source walk,
+# ~1.2s measured) but this function runs on every commit AND checkout AND merge, so an
+# unthrottled heal would fork a process per commit for no benefit — index damage does not
+# appear between two commits a minute apart. The epoch is stored IN the marker file rather
+# than read from its mtime, which keeps this portable (no stat -c vs stat -f split). A
+# MISSING marker means "never healed" and is therefore due, so the first pull after an
+# upgrade repairs whatever the previous version left behind with nothing to run by hand.
+_sumela_heal_due() {  # $1 = install root
+  local marker="$1/.sumela/.heal-last"
+  local interval="${SUMELA_HEAL_INTERVAL_SECONDS:-21600}"   # 6h
+  [ -f "$marker" ] || return 0
+  local now last
+  now="$(date +%s 2>/dev/null)" || return 1
+  last="$(cat "$marker" 2>/dev/null)"
+  case "$last" in ''|*[!0-9]*) return 0 ;; esac
+  [ $(( now - last )) -ge "$interval" ]
+}
+
+_sumela_heal_mark() {  # $1 = install root
+  date +%s > "$1/.sumela/.heal-last" 2>/dev/null || true
+}
+
 sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
   local from="$1" to="$2"
   [ -n "${SUMELA_DISABLE_CODE_SYNC:-}" ] && return 0
@@ -454,9 +476,20 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
       "${install_rel:-.}" ":(exclude)${scope}docs" ":(exclude)${scope}.sumela" 2>/dev/null)"
   deleted="$(git -C "$repo" -c core.quotePath=false diff --name-only --diff-filter=D "$from" "$to" -- \
       "${install_rel:-.}" ":(exclude)${scope}docs" ":(exclude)${scope}.sumela" 2>/dev/null)"
-  [ -n "$changed$deleted" ] || return 0
+  # A heal pass is worth running even when this ref range touched no code at all — that
+  # is exactly the shape of a SumelaOS upgrade (it only writes under .sumela/, which is
+  # excluded above), and the whole point is that the upgrade repairs the damage the
+  # previous version left without the developer doing anything.
+  local heal=""
+  _sumela_heal_due "$install" && heal=1
+  [ -n "$changed$deleted$heal" ] || return 0
 
-  _sumela_qdrant_up || { echo "sumela: code_chunks sync skipped (Qdrant not reachable)"; return 0; }
+  if ! _sumela_qdrant_up; then
+    # Only worth saying out loud when there was real work to skip; a quiet heal tick on
+    # an unrelated commit must not add a line to every pull.
+    [ -n "$changed$deleted" ] && echo "sumela: code_chunks sync skipped (Qdrant not reachable)"
+    return 0
+  fi
 
   local log="$install/.sumela/.memory-sync.log"
 
@@ -469,15 +502,15 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
     ) >>"$log" 2>&1 </dev/null &
   fi
 
-  # RE-EMBED — only when code was added/modified.
-  [ -n "$changed" ] || return 0
+  # RE-EMBED — when code was added/modified, or when a heal pass is due.
+  [ -n "$changed$heal" ] || return 0
 
   # SUMELA_PULL_CODE_REINGEST=1 -> full tree re-embed; otherwise incremental on just
   # the changed files. The changed list is handed to the ingest script via a temp
   # file (robust for any number of paths and detached background stdin).
   local full="${SUMELA_PULL_CODE_REINGEST:-}"
   local changed_list=""
-  if [ -z "$full" ]; then
+  if [ -z "$full" ] && [ -n "$changed" ]; then
     changed_list="$(mktemp 2>/dev/null)" || changed_list=""
     if [ -n "$changed_list" ]; then
       printf '%s\n' "$changed" >"$changed_list"
@@ -486,11 +519,16 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
     fi
   fi
 
+  # Announce real work only. A due heal on a pull that changed no code stays silent
+  # here and reports into the log — it needs no decision from the developer, and a line
+  # on every pull would train them to ignore this channel.
   if [ -n "$full" ]; then
     echo "sumela: re-embedding the full source tree into Qdrant code_chunks in background (log: .sumela/.memory-sync.log)"
-  else
+  elif [ -n "$changed" ]; then
     echo "sumela: re-embedding $(printf '%s\n' "$changed" | grep -c .) changed code file(s) into Qdrant code_chunks in background (incremental; log: .sumela/.memory-sync.log)"
   fi
+
+  [ -n "$heal" ] && _sumela_heal_mark "$install"
 
   ( trap '[ -n "$changed_list" ] && rm -f "$changed_list"' EXIT   # clean up even if cd below fails
     cd "$install" || exit 0
@@ -498,8 +536,12 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
     local ok=0
     if [ -n "$full" ]; then
       python3 "$ingest" || ok=1
+    elif [ -n "$changed_list" ]; then
+      # ONE run for both jobs — two ingests racing over the same collection would
+      # delete-then-upsert the same file paths concurrently.
+      python3 "$ingest" --changed-file "$changed_list" ${heal:+--heal} || ok=1
     else
-      python3 "$ingest" --changed-file "$changed_list" || ok=1
+      python3 "$ingest" --heal || ok=1
     fi
     [ "$ok" -ne 0 ] && echo "WARN: code ingest failed"
     echo "===== code-sync: done ====="

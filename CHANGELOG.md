@@ -152,9 +152,34 @@ check can detect a newer upstream via `git ls-remote --tags`.
   multiplying a crash's blast radius; the measurement said otherwise, and the retry plus
   all-or-nothing changes above address the blast radius directly.)
 
-  **Consuming repos must re-ingest after updating** — the fix stops new damage but does
-  not repair points already missing: `python3 .sumela/memory-plugins/qdrant-session-memory/scripts/ingest-code-to-qdrant.py`
-  (and the wiki twin) for a full rebuild.
+- **The code index now heals itself — existing damage is repaired with nothing to run by
+  hand (v0.12.1).** The fix above stops NEW damage but cannot repair points already
+  missing, and nothing would have come back for them: the pull hook only re-embeds files
+  changed in that pull, and it excludes `.sumela/`, so **the upgrade itself triggers no
+  re-ingest at all**. Every existing install would have kept a silently incomplete index
+  forever. Worse, the all-or-nothing rule above deliberately leaves a file stale when a
+  chunk fails — the right trade, but permanent without a healer. So the two ship together.
+  - `ingest-code-to-qdrant.py --heal` finds both damage shapes — entries holding fewer
+    points than their own `total_chunks`, and files on disk with no points at all — and
+    feeds them through the existing `--changed-file` path. Damage is **self-identifying**:
+    every point already carries `total_chunks`, so no bookkeeping is needed anywhere else.
+  - The pull/checkout/commit hook runs it automatically, throttled to once per 6h
+    (`SUMELA_HEAL_INTERVAL_SECONDS`) so it costs nothing per commit — and **always due when
+    the marker is absent**, so the first pull after upgrading repairs the backlog. It
+    merges with an incremental run into ONE ingest, so two runs never race the same file.
+  - A file that can never embed is retired after `SUMELA_HEAL_MAX_ATTEMPTS` (3) strikes
+    and reported, instead of being retried on every pull forever — replacing a silent hole
+    with a silent loop would be no better.
+  - An empty collection defers to the existing "promote to FULL" path rather than
+    reporting every file as damaged.
+  - `ingest-wiki-to-qdrant.py` needs no `--heal`: it re-walks every page on each run, so
+    all-or-nothing already makes it self-correcting.
+
+  Measured on a 15.5k-file repo: detection is **0.11 s** (payload-only scroll over 21k
+  points) plus **~1.0 s** for the source walk; the first heal there had 404 entries to
+  repair (334 partial, 70 absent). New per-developer state (`.sumela/.heal-last`,
+  `.sumela/.heal-state-*.json`) is added to `scripts/lib/sumela-gitignore.list`, the
+  single source both setup and update reconcile from, so it reaches upgraded installs too.
 
 - **graphify plugin: rebuilds hard-failed without an LLM key on repos with docs (v0.9.1).**
   Field report from a consuming repo (graphify CLI 0.8.35, 308 non-code doc/image files):

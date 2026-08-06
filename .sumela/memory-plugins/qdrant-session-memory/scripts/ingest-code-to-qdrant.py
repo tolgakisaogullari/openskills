@@ -49,6 +49,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.memory_ingest import (
     get_repo_root, chunk_text, get_embedding, deterministic_id, print_report,
     resolve_collection_arg, project_slug, qdrant_client_preflight, EMBED_MAX_WORKERS,
+    scan_entry_completeness, load_heal_state, save_heal_state, apply_heal_outcome,
+    HEAL_MAX_ATTEMPTS,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -238,6 +240,28 @@ def incremental_select(changed_file: Path) -> List[Path]:
     return sorted(out)
 
 
+def heal_select(client) -> "tuple[List[Path], int]":
+    """Files the index is missing or only half knows. Returns (files, retired_count).
+
+    Two failure shapes, both invisible without this: an entry with fewer points than its
+    own `total_chunks` (a run died part-way through the file), and a file on disk with no
+    points at all (every chunk failed). Entries that have already used up
+    HEAL_MAX_ATTEMPTS are retired from the rotation so a permanently-unembeddable file
+    cannot spin on every pull forever.
+    """
+    incomplete, known = scan_entry_completeness(client, COLLECTION_NAME, "file_path")
+    on_disk = {}
+    for path in full_walk():
+        if not should_skip_file(path):
+            on_disk[path.relative_to(REPO_ROOT).as_posix()] = path
+    absent = set(on_disk) - known
+    candidates = (incomplete | absent) & set(on_disk)
+
+    state = load_heal_state(REPO_ROOT, COLLECTION_NAME)
+    retired = {c for c in candidates if state.get(c, 0) >= HEAL_MAX_ATTEMPTS}
+    return sorted(on_disk[c] for c in candidates - retired), len(retired)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Ingest source code into Qdrant code_chunks.")
     parser.add_argument(
@@ -245,6 +269,12 @@ def main():
         default=None,
         help="Path to a file of newline-separated repo-relative paths to ingest "
              "incrementally. Omit for a full src/ walk.",
+    )
+    parser.add_argument(
+        "--heal",
+        action="store_true",
+        help="Also re-ingest files the index is missing or only partially holds. "
+             "Combines with --changed-file into ONE run.",
     )
     args = parser.parse_args()
 
@@ -265,16 +295,30 @@ def main():
         report_failure("Collection", f"Qdrant unavailable: {e}")
         sys.exit(1)
 
-    incremental = args.changed_file is not None
+    incremental = args.changed_file is not None or args.heal
+    # An empty collection is not damage to heal — it is a first build. Defer to the
+    # existing promotion so a fresh clone does not report 15k "incomplete" files.
     if incremental and empty:
         print(f"[info] '{COLLECTION_NAME}' is empty — promoting incremental run to a full build")
         incremental = False
 
-    mode = "incremental" if incremental else "full"
-
+    heal_paths: List[Path] = []
     if incremental:
-        code_files = incremental_select(Path(args.changed_file))
+        code_files = incremental_select(Path(args.changed_file)) if args.changed_file else []
+        if args.heal:
+            heal_paths, retired = heal_select(client)
+            if retired:
+                print(f"[warn] {retired} file(s) have failed {HEAL_MAX_ATTEMPTS} heal attempts "
+                      f"and are no longer retried automatically — see {COLLECTION_NAME} "
+                      f"heal state under .sumela/")
+            if heal_paths:
+                print(f"[info] healing {len(heal_paths)} file(s) missing or partially indexed")
+            # ONE run: a pull that both changed code and found damage must not race two
+            # ingests over the same collection.
+            code_files = sorted(set(code_files) | set(heal_paths))
+        mode = "heal" if args.heal and not args.changed_file else "incremental"
     else:
+        mode = "full"
         if not SRC_DIR.exists():
             # Nothing to ingest (no source tree) — not an error.
             report_success(0, 0, True, mode)
@@ -308,6 +352,14 @@ def main():
             all_jobs.append((rel_path, file_type, i, chunk, len(chunks)))
 
     if not all_jobs:
+        # Heal candidates that yield no chunks at all (empty or fully filtered) still
+        # count as attempts — otherwise they are re-detected as "absent" on every pull
+        # and the healer churns on them forever.
+        if args.heal and heal_paths:
+            attempted = {p.relative_to(REPO_ROOT).as_posix() for p in heal_paths}
+            save_heal_state(REPO_ROOT, COLLECTION_NAME,
+                            apply_heal_outcome(load_heal_state(REPO_ROOT, COLLECTION_NAME),
+                                               attempted, attempted))
         report_success(0, 0, True, mode)
         sys.exit(0)
 
@@ -359,6 +411,7 @@ def main():
 
     total_chunks = 0
     files_ingested = 0
+    upserted_ok = set()
 
     for rel_path, chunks_data in files.items():
         # Delete ALL existing points for this file (by file_path) BEFORE upserting, so a
@@ -397,9 +450,20 @@ def main():
             client.upsert(collection_name=COLLECTION_NAME, points=points)
             total_chunks += len(points)
             files_ingested += 1
+            upserted_ok.add(rel_path)
             print(f"  Ingested: {rel_path} ({len(points)} chunks)")
         except Exception as e:
             print(f"[warn] upsert failed for {rel_path}: {e}")
+
+    if args.heal and heal_paths:
+        # "Unresolved" is anything we tried to heal that did NOT end up upserted — a
+        # failed embed, a failed upsert, or a file that yields no chunks at all (empty
+        # or filtered). All three would otherwise be re-detected on every single pull;
+        # the strike counter retires them instead of churning forever.
+        attempted = {p.relative_to(REPO_ROOT).as_posix() for p in heal_paths}
+        save_heal_state(REPO_ROOT, COLLECTION_NAME,
+                        apply_heal_outcome(load_heal_state(REPO_ROOT, COLLECTION_NAME),
+                                           attempted, attempted - upserted_ok))
 
     qdrant_ok = total_chunks > 0
     report_success(files_ingested, total_chunks, qdrant_ok, mode, len(failed_files))

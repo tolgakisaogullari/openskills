@@ -417,6 +417,89 @@ def get_embedding(text: str, ollama_url: str, model: str = DEFAULT_EMBED_MODEL,
     raise last_error
 
 
+# --- self-healing index ------------------------------------------------------
+# The pipeline repairs its own gaps instead of asking the operator to notice one. It has
+# to: an ingest leaves a file untouched when any of its chunks fails (see the all-or-
+# nothing rule in the ingest scripts), which trades a silently INCOMPLETE entry for a
+# silently STALE one — better, but still permanent unless something later comes back for
+# it. Nothing else will: the pull hook only re-embeds files changed in that pull, so a
+# file that failed once is never revisited until it happens to be edited again.
+HEAL_MAX_ATTEMPTS = int(os.getenv("SUMELA_HEAL_MAX_ATTEMPTS", "3"))
+
+
+def scan_entry_completeness(client, collection: str, id_key: str,
+                            page: int = 4000) -> "tuple[set, set]":
+    """Return (incomplete, known) identities for `collection`.
+
+    `incomplete` = entries whose stored point count is below their own `total_chunks`;
+    every point carries that field, so a half-written entry is SELF-IDENTIFYING and
+    needs no bookkeeping anywhere else. `known` = every identity present at all, which
+    the caller diffs against disk to find entries missing entirely.
+
+    Payload-only scroll — measured at 0.11 s over 21k points / 15.5k files, cheap enough
+    to run on every pull.
+    """
+    have, total, offset = {}, {}, None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection, limit=page, offset=offset,
+            with_payload=[id_key, "total_chunks"], with_vectors=False,
+        )
+        for point in points:
+            payload = point.payload or {}
+            ident = payload.get(id_key)
+            if not ident:
+                continue
+            have[ident] = have.get(ident, 0) + 1
+            total[ident] = payload.get("total_chunks")
+        if offset is None:
+            break
+    incomplete = {i for i, n in have.items() if total.get(i) and n < total[i]}
+    return incomplete, set(have)
+
+
+def _heal_state_path(root: Path, collection: str) -> Path:
+    return Path(root) / ".sumela" / f".heal-state-{collection}.json"
+
+
+def load_heal_state(root: Path, collection: str) -> dict:
+    """{identity: consecutive failed heal attempts}. Never raises — a corrupt or missing
+    state file must not block an ingest."""
+    try:
+        import json
+        return json.loads(_heal_state_path(root, collection).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_heal_state(root: Path, collection: str, state: dict) -> None:
+    """Best-effort persist; a read-only or missing .sumela dir is not worth failing over."""
+    try:
+        import json
+        path = _heal_state_path(root, collection)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=0, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def apply_heal_outcome(state: dict, attempted, failed) -> dict:
+    """Fold one heal round into the attempt state.
+
+    An entry that heals is forgotten; one that fails again gets a strike. Past
+    HEAL_MAX_ATTEMPTS it stops being retried — without this an entry that can never
+    embed would be retried on every pull forever, invisibly, which is its own silent
+    failure. The retirement is reported once by the caller rather than swallowed.
+    """
+    failed = set(failed)
+    for ident in attempted:
+        if ident in failed:
+            state[ident] = state.get(ident, 0) + 1
+        else:
+            state.pop(ident, None)
+    return state
+
+
 def deterministic_id(key: str, chunk_index: int) -> str:
     """Generate a deterministic, process-independent UUID point ID."""
     hex_str = hashlib.sha256(f"{key}_{chunk_index}".encode("utf-8")).hexdigest()[:32]

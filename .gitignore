@@ -39,6 +39,8 @@ docs/second-brain/wiki/
 .sumela/.code-chunks-synced
 .sumela/.update-check
 .sumela/.retrieval-cache.json
+.sumela/.heal-last
+.sumela/.heal-state-*.json
 
 # Per-developer overrides (personal; .example stays tracked)
 .sumela/local.md
