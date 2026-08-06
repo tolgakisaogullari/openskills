@@ -540,21 +540,14 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
     echo "sumela: re-embedding $(printf '%s\n' "$changed" | grep -c .) changed code file(s) into Qdrant code_chunks in background (incremental; log: .sumela/.memory-sync.log)"
   fi
 
-  if [ -n "$heal" ]; then
-    # An unwritable marker means the throttle cannot arm; running anyway would fork an
-    # ingest on every single git operation. Drop the heal and keep the normal sync.
-    _sumela_heal_mark "$install" || heal=""
-  fi
-  [ -n "$changed$full$heal" ] || return 0
-
   # A heal-only run against a pre-0.12.1 ingest would die on `unrecognized arguments`,
   # and because both jobs share one invocation that would take the incremental re-embed
-  # down with it. Teammates get every framework file atomically from one pull, but
-  # `update.sh --review` lets a maintainer apply _lib.sh while skipping the plugin.
-  if [ -n "$heal" ] && ! grep -q -- '--heal' "$ingest" 2>/dev/null; then
+  # down with it. Probe --help rather than grepping the source: a Usage docstring
+  # mentioning the flag would satisfy a text match while argparse still rejects it.
+  if [ -n "$heal" ] && ! python3 "$ingest" --help 2>/dev/null | grep -q -- '--heal'; then
     heal=""
-    [ -n "$changed" ] || return 0
   fi
+  [ -n "$changed$full$heal" ] || return 0
 
   ( trap '[ -n "$changed_list" ] && rm -f "$changed_list"' EXIT   # clean up even if cd below fails
     cd "$install" || exit 0
@@ -563,26 +556,83 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
     # NEXT commit's incremental run would otherwise delete-then-upsert the same file
     # paths concurrently and the slower run would win with staler content.
     lock="$install/.sumela/.ingest.lock"
+    pend="$install/.sumela/.ingest-pending"
     if ! mkdir "$lock" 2>/dev/null; then
-      # Stale lock (killed process, crashed shell) must not disable sync forever.
-      if [ -n "$(find "$lock" -maxdepth 0 -mmin +120 2>/dev/null)" ]; then
-        rmdir "$lock" 2>/dev/null && mkdir "$lock" 2>/dev/null || exit 0
+      # Distinguish "held" from "cannot create at all" (read-only FS, ENOSPC): treating
+      # the latter as contention would claim another ingest is running, forever.
+      [ -d "$lock" ] || { echo "===== code-sync: cannot create $lock — skipping ====="; exit 0; }
+      # A live holder refreshes nothing, so age alone would declare a legitimate 2h+
+      # full build stale and start a second ingest beside it. Reclaim only when the
+      # recorded owner is gone.
+      holder="$(cat "$lock/pid" 2>/dev/null)"
+      stale=0
+      case "$holder" in
+        ''|*[!0-9]*) stale=1 ;;                       # no/garbage owner — treat as abandoned
+        *) kill -0 "$holder" 2>/dev/null || stale=1 ;;
+      esac
+      # Owner still alive but the lock is ancient: a wedged process. A real full build
+      # is minutes, so 12h can only mean stuck. (Also covers a recycled PID that now
+      # belongs to an unrelated long-lived process, which would otherwise block forever.)
+      if [ "$stale" -eq 0 ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +720 2>/dev/null)" ]; then
+        stale=1
+      fi
+      if [ "$stale" -eq 1 ]; then
+        # rename(2) is atomic, so exactly ONE racer can claim the stale dir. rmdir+mkdir
+        # let a second racer delete the winner's FRESH lock and take it too. rm -rf, not
+        # rmdir: a stray .DS_Store inside must not wedge sync permanently.
+        gone="$lock.stale.$$"
+        mv "$lock" "$gone" 2>/dev/null || exit 0
+        rm -rf "$gone" 2>/dev/null
+        mkdir "$lock" 2>/dev/null || exit 0
+        echo "===== code-sync: reclaimed an abandoned lock ====="
       else
-        echo "===== code-sync: skipped, another ingest holds $lock ====="
+        # Do NOT discard the work: heal only finds MISSING or PARTIAL entries, so a
+        # modified file whose re-embed is dropped keeps its old, complete-looking chunks
+        # and nothing ever repairs it. Park the paths for the next run instead.
+        if [ -n "$changed_list" ]; then
+          cat "$changed_list" >>"$pend" 2>/dev/null \
+            && echo "===== code-sync: deferred $(grep -c . "$changed_list") file(s) to .ingest-pending ====="
+        else
+          echo "===== code-sync: deferred, another ingest holds $lock ====="
+        fi
         exit 0
       fi
     fi
-    trap 'rmdir "$lock" 2>/dev/null; [ -n "$changed_list" ] && rm -f "$changed_list"' EXIT
+    echo $$ > "$lock/pid" 2>/dev/null
+    trap 'rmdir "$lock" 2>/dev/null || rm -rf "$lock" 2>/dev/null
+          [ -n "$changed_list" ] && rm -f "$changed_list"' EXIT
+    # Fold in anything a contended earlier run parked. The backlog is cleared only
+    # AFTER the ingest actually ran — clearing it up front would lose those paths for
+    # good if this run then failed to start.
+    merged_pending=0
+    if [ -s "$pend" ] && [ -n "$changed_list" ]; then
+      cat "$pend" >>"$changed_list" && merged_pending=1
+      sort -u "$changed_list" -o "$changed_list" 2>/dev/null
+    fi
+    # Arm the throttle only now — doing it before the lock burned the 6h window on a
+    # heal that never ran.
+    [ -n "$heal" ] && _sumela_heal_mark "$install"
     echo "===== code-sync(ingest) @ $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) ====="
     ok=0
     if [ -n "$full" ]; then
-      python3 "$ingest" || ok=1
+      python3 "$ingest" || ok=$?
     elif [ -n "$changed_list" ]; then
-      python3 "$ingest" --changed-file "$changed_list" ${heal:+--heal} || ok=1
+      python3 "$ingest" --changed-file "$changed_list" ${heal:+--heal} || ok=$?
     else
-      python3 "$ingest" --heal || ok=1
+      python3 "$ingest" --heal || ok=$?
     fi
-    [ "$ok" -ne 0 ] && echo "WARN: code ingest reported a problem (see the report above)"
+    # 2 = ran, some entries stale (re-run will finish them); anything else non-zero
+    # means it could not run. Flattening the two trains people to ignore the channel.
+    if [ "$ok" = 2 ]; then
+      echo "NOTE: code ingest completed with stale entries (see the report above)"
+    elif [ "$ok" -ne 0 ]; then
+      echo "WARN: code ingest failed (rc=$ok)"
+    fi
+    # 0 and 2 both mean the run happened, so the parked paths were processed. Any other
+    # code means it never started — keep the backlog for the next attempt.
+    if [ "$merged_pending" -eq 1 ] && { [ "$ok" = 0 ] || [ "$ok" = 2 ]; }; then
+      : >"$pend"
+    fi
     echo "===== code-sync: done ====="
   ) >>"$log" 2>&1 </dev/null &
   return 0

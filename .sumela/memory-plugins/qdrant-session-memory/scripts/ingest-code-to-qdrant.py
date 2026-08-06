@@ -62,7 +62,8 @@ from lib.memory_ingest import (
     get_repo_root, chunk_text, get_embedding, deterministic_id, print_report,
     resolve_collection_arg, project_slug, qdrant_client_preflight, EMBED_MAX_WORKERS,
     scan_entry_completeness, load_heal_state, save_heal_state, apply_heal_outcome,
-    HEAL_MAX_ATTEMPTS, ollama_preflight, EMBED_DIM,
+    HEAL_MAX_ATTEMPTS, ollama_preflight, EMBED_DIM, project_scope_should,
+    EmbeddingBackendUnavailable,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -172,9 +173,19 @@ SECRET_PATTERNS = (
 
 
 def should_skip_file(file_path: Path) -> bool:
-    """Return True if the file should not be ingested."""
+    """Return True if the file should not be ingested.
+
+    Directory exclusions are matched against the REPO-RELATIVE parts. Matching absolute
+    parts meant a clone living under any directory named build/, dist/, venv/, obj/ or
+    node_modules/ excluded its own entire tree — ingesting nothing, silently. That was
+    survivable when a full walk only ran on a manual rebuild; the healer runs one on a
+    schedule, so it would be a permanent silent no-op.
+    """
     name = file_path.name
-    parts = set(file_path.parts)
+    try:
+        parts = set(file_path.relative_to(REPO_ROOT).parts)
+    except ValueError:
+        parts = set(file_path.parts)   # outside the repo — fall back to the old behaviour
 
     if parts & EXCLUDED_DIRS:
         return True
@@ -208,7 +219,14 @@ def ensure_collection(client: QdrantClient) -> bool:
         print(f"[info] created collection '{COLLECTION_NAME}' ({EMBED_DIM}-dim, {DISTANCE})")
         return True
     try:
-        return client.count(collection_name=COLLECTION_NAME, exact=False).count == 0
+        # Scoped like every other read: under a shared collection an unscoped count sees
+        # the OTHER project's points, so a project with nothing indexed reads as
+        # non-empty and skips the "nothing to heal" guard — landing in a silent
+        # full-tree re-embed, the exact outcome that guard exists to prevent.
+        return client.count(
+            collection_name=COLLECTION_NAME, exact=False,
+            count_filter=Filter(should=project_scope_should(PROJECT_SLUG)),
+        ).count == 0
     except Exception:
         # Collection exists but count failed — don't guess a full re-embed; let the
         # incremental list drive the work.
@@ -225,11 +243,25 @@ def full_walk() -> List[Path]:
     JS monorepo it would have been tens of seconds of disk I/O per heal.
     """
     code_files: List[Path] = []
-    for dirpath, dirnames, filenames in os.walk(SRC_DIR):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS]
+    for dirpath, dirnames, filenames in os.walk(SRC_DIR, followlinks=False):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in EXCLUDED_DIRS and not os.path.islink(os.path.join(dirpath, d))
+        ]
         for name in filenames:
-            if _matches_code_pattern(name):
-                code_files.append(Path(dirpath) / name)
+            if not _matches_code_pattern(name):
+                continue
+            fp = Path(dirpath) / name
+            # Mirror the wiki walk's containment guard: a committed symlink such as
+            # src/config.py -> ~/.aws/credentials would otherwise be read and embedded.
+            # incremental_select already resolves and containment-checks; without this
+            # the two selection paths disagree on what is ingestable.
+            if fp.is_symlink():
+                continue
+            rp = fp.resolve()
+            if rp != REPO_ROOT and REPO_ROOT not in rp.parents:
+                continue
+            code_files.append(fp)
     return sorted(set(code_files))
 
 
@@ -398,9 +430,12 @@ def main():
         # and the healer churns on them forever.
         if args.heal and heal_paths:
             attempted = {p.relative_to(REPO_ROOT).as_posix() for p in heal_paths}
+            # No chunks at all (empty or fully filtered) is a property of the FILE, so
+            # it strikes — otherwise such a file is re-detected as absent on every pull
+            # and the healer churns on it forever.
             save_heal_state(REPO_ROOT, COLLECTION_NAME,
                             apply_heal_outcome(load_heal_state(REPO_ROOT, COLLECTION_NAME),
-                                               attempted, attempted),
+                                               attempted, attempted, backend_ok=True),
                             keep=attempted)
         report_success(0, 0, True, mode)
         sys.exit(0)
@@ -423,9 +458,12 @@ def main():
                 embedding_map[key] = e
 
     # Group by rel_path for idempotent delete + upsert. A file is ALL-OR-NOTHING:
-    # see the skip loop below.
+    # see the skip loop below. backend_ok distinguishes "this file cannot embed" from
+    # "the machine could not reach Ollama" — only the former may cost a heal strike.
     files = {}
     failed_files = {}
+    backend_ok = not any(isinstance(e, EmbeddingBackendUnavailable)
+                         for e in embedding_map.values() if isinstance(e, Exception))
     for rel_path, file_type, i, chunk, total in all_jobs:
         key = (rel_path, i)
         emb = embedding_map.get(key)
@@ -464,14 +502,14 @@ def main():
         try:
             client.delete(
                 collection_name=COLLECTION_NAME,
-                # project_slug is part of the selector, not just the payload: under the
-                # CODE_CHUNKS_COLLECTION override two repos share a collection, and a
-                # path-only filter would delete the OTHER project's identically-named
-                # file. Cheap to scope, expensive to discover.
-                points_selector=Filter(must=[
-                    FieldCondition(key="file_path", match=MatchValue(value=rel_path)),
-                    FieldCondition(key="project_slug", match=MatchValue(value=PROJECT_SLUG)),
-                ]),
+                # Scoped so a shared collection (CODE_CHUNKS_COLLECTION override) cannot
+                # have one repo delete another's identically-named file — but tolerant of
+                # legacy unstamped points, or the delete misses them and every file ends
+                # up duplicated. See project_scope_should.
+                points_selector=Filter(
+                    must=[FieldCondition(key="file_path", match=MatchValue(value=rel_path))],
+                    should=project_scope_should(PROJECT_SLUG),
+                ),
             )
         except Exception as e:
             print(f"[warn] delete failed for {rel_path}: {e}")
@@ -518,7 +556,8 @@ def main():
         # deleted from disk would otherwise accumulate forever.
         save_heal_state(REPO_ROOT, COLLECTION_NAME,
                         apply_heal_outcome(load_heal_state(REPO_ROOT, COLLECTION_NAME),
-                                           attempted, attempted - upserted_ok),
+                                           attempted, attempted - upserted_ok,
+                                           backend_ok=backend_ok),
                         keep=attempted)
 
     qdrant_ok = total_chunks > 0
@@ -530,9 +569,12 @@ def main():
     #   0 = index fully refreshed
     #   2 = ran, but some entries are NOT up to date (re-run to finish)
     #   1 = could not run / nothing ingested
-    if not qdrant_ok:
-        sys.exit(1)
-    sys.exit(2 if (failed_files or upsert_failed) else 0)
+    if failed_files or upsert_failed:
+        # It RAN — the preflights passed — some entries are just not up to date. Telling
+        # the operator "could not run, fix the dependency" would send them chasing a
+        # backend that is fine.
+        sys.exit(2)
+    sys.exit(0 if qdrant_ok else 1)
 
 
 if __name__ == "__main__":

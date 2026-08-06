@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.memory_ingest import resolve_collection_arg
+from lib.memory_ingest import resolve_collection_arg, project_slug, project_scope_should
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -41,6 +41,9 @@ def main() -> int:
     p.add_argument("--value", required=True, help="Value the payload field must equal for a point to be deleted.")
     p.add_argument("--host", default=os.getenv("QDRANT_HOST", "localhost"))
     p.add_argument("--port", type=int, default=int(os.getenv("QDRANT_PORT", "6333")))
+    p.add_argument("--project-slug", default=None,
+                   help="Restrict the delete to this project (plus legacy unstamped points). "
+                        "Defaults to the current repo's slug; pass an empty string to disable.")
     a = p.parse_args()
 
     try:
@@ -53,9 +56,16 @@ def main() -> int:
     collection = resolve_collection_arg(a.collection)
     try:
         client = QdrantClient(host=a.host, port=a.port, check_compatibility=False)
+        # Scoped for the same reason the ingest delete is — and it matters MORE here:
+        # the prune deletes without re-upserting, so under a shared collection an
+        # unscoped match wipes another repo's identically-named file outright.
+        scope = project_slug() if a.project_slug is None else a.project_slug
         client.delete(
             collection_name=collection,
-            points_selector=Filter(must=[FieldCondition(key=a.key, match=MatchValue(value=a.value))]),
+            points_selector=Filter(
+                must=[FieldCondition(key=a.key, match=MatchValue(value=a.value))],
+                should=project_scope_should(scope) if scope else None,
+            ),
         )
         print(f"delete-from-qdrant: removed points where {a.key} == '{a.value}' from '{collection}'.")
     except Exception as e:  # collection missing / Qdrant down / etc. — never fail the caller.

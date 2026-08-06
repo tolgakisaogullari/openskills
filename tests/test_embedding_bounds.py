@@ -61,6 +61,10 @@ def install_fake_requests(responses):
     """
     calls = []
     fake = types.ModuleType("requests")
+    # get_embedding catches requests.ConnectionError/Timeout by name to classify a
+    # backend outage, so the stub must carry them or it diverges from the real module.
+    fake.ConnectionError = type("ConnectionError", (Exception,), {})
+    fake.Timeout = type("Timeout", (Exception,), {})
 
     def post(url, json=None, timeout=None):
         calls.append({"url": url, "json": json, "timeout": timeout})
@@ -187,6 +191,39 @@ def main():
           isinstance(raised, RuntimeError))
     check("no silent success after exhausted retries", len(calls) == 2)
 
+    # A connection-level failure is about the MACHINE, not the input — it must surface
+    # as a distinct type so heal bookkeeping does not strike a perfectly good file.
+    fake = types.ModuleType("requests")
+    class _ConnErr(Exception): pass
+    class _Timeout(Exception): pass
+    fake.ConnectionError = _ConnErr
+    fake.Timeout = _Timeout
+    def _post_conn(url, json=None, timeout=None):
+        raise _ConnErr("connection refused")
+    fake.post = _post_conn
+    sys.modules["requests"] = fake
+    _mod.EMBED_RETRY_DELAY_SECONDS = 0
+    raised = None
+    try:
+        get_embedding("merhaba", "http://localhost:11434")
+    except Exception as e:      # noqa: BLE001
+        raised = e
+    check("a connection failure raises EmbeddingBackendUnavailable",
+          isinstance(raised, _mod.EmbeddingBackendUnavailable))
+
+    # An empty embedding array is a 200 response Ollama really produces on soft failures.
+    calls = install_fake_requests([_FakeResponse({"embedding": []}),
+                                   _FakeResponse({"embedding": []})])
+    raised = None
+    try:
+        get_embedding("merhaba", "http://localhost:11434")
+    except Exception as e:      # noqa: BLE001
+        raised = e
+    check("an empty embedding is rejected rather than stored",
+          isinstance(raised, ValueError))
+    check("a wrong-dimension response is NOT a backend-unavailable error",
+          not isinstance(raised, _mod.EmbeddingBackendUnavailable))
+
     sys.modules.pop("requests", None)
 
     # --- self-heal: incomplete entries are self-identifying -------------------------
@@ -244,14 +281,28 @@ def main():
     state = _mod.apply_heal_outcome(state, {"bad.cs"}, set())
     check("a later success clears the strikes", "bad.cs" not in state)
 
-    # A round where EVERYTHING failed is evidence about the backend, not the files.
-    # Recording strikes there retires the whole backlog after three outages and
-    # permanently disables the healer — a silent shutdown replacing a silent hole.
+    # The healer's STEADY STATE is "every candidate failed": files that heal leave the
+    # set, so it converges to only-broken ones. An earlier version inferred "the backend
+    # is down" from that shape and stopped recording — which made retirement unreachable
+    # and a lone broken file immortal. The signal must come from the caller.
+    state = {}
+    for _ in range(_mod.HEAL_MAX_ATTEMPTS):
+        state = _mod.apply_heal_outcome(state, {"lonely.cs"}, {"lonely.cs"})
+    check("a LONE permanently-broken candidate still reaches retirement",
+          state.get("lonely.cs", 0) >= _mod.HEAL_MAX_ATTEMPTS)
+    state = {}
+    for _ in range(_mod.HEAL_MAX_ATTEMPTS):
+        state = _mod.apply_heal_outcome(state, {"a.cs", "b.cs"}, {"a.cs", "b.cs"})
+    check("an all-broken candidate set still retires",
+          all(state.get(k, 0) >= _mod.HEAL_MAX_ATTEMPTS for k in ("a.cs", "b.cs")))
+    # ...but a genuine backend outage must still cost nobody a strike.
     state = {}
     for _ in range(_mod.HEAL_MAX_ATTEMPTS + 2):
-        state = _mod.apply_heal_outcome(state, {"a.cs", "b.cs", "c.cs"}, {"a.cs", "b.cs", "c.cs"})
-    check("a total outage records NO strikes", state == {})
-    state = _mod.apply_heal_outcome(state, {"a.cs", "b.cs"}, {"a.cs"})
+        state = _mod.apply_heal_outcome(state, {"a.cs", "b.cs"}, {"a.cs", "b.cs"},
+                                        backend_ok=False)
+    check("a backend outage records NO strikes", state == {})
+
+    state = _mod.apply_heal_outcome({}, {"a.cs", "b.cs"}, {"a.cs"})
     check("a partial failure still strikes the failing entry", state.get("a.cs") == 1)
     check("a partial failure clears the succeeding entry", "b.cs" not in state)
 

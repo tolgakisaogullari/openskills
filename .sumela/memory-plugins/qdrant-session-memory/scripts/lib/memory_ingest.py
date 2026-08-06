@@ -3,7 +3,7 @@ scripts/lib/memory_ingest.py — Shared ingestion utilities (v1.0)
 
 Common helpers for wiki and code ingestion pipelines.
 """
-import sys, os, re, time, hashlib, uuid
+import sys, os, re, time, math, hashlib, uuid
 from pathlib import Path
 from typing import List
 
@@ -330,6 +330,11 @@ def _env_num(name: str, default, minimum, cast=int):
     except (TypeError, ValueError):
         print(f"[warn] {name}={raw!r} is not a number; using {default}", file=sys.stderr)
         return default
+    if isinstance(value, float) and not math.isfinite(value):
+        # inf/nan parse cleanly as floats; `SUMELA_EMBED_RETRY_DELAY=inf` would put a
+        # git hook's background ingest to sleep forever.
+        print(f"[warn] {name}={raw!r} is not finite; using {default}", file=sys.stderr)
+        return default
     if value < minimum:
         print(f"[warn] {name}={value} is below the {minimum} floor; using {minimum}",
               file=sys.stderr)
@@ -377,9 +382,10 @@ def estimate_tokens(text: str) -> int:
     case in practice because it has no word spaces, so a whole paragraph collapses to
     one "word" and always takes the character-split path.
 
-    The +2 covers the special tokens the server appends (this model sets add_eos_token);
-    that margin is why digit-heavy ASCII — 3054 bytes producing 3055 tokens, the densest
-    single-byte case measured — still fits under the bound.
+    The +2 covers the special tokens the server appends (this model sets add_eos_token).
+    Adversarial probing across 17 content classes (digits, byte-fallback PUA, Tags,
+    combining marks, ZWJ emoji, the U+FDFD NFKC bomb, CJK Ext-B) measured a peak density
+    of 0.928 tokens/byte, so the bound holds with real slack rather than by a hair.
     """
     return len(text.encode("utf-8")) + 2
 
@@ -469,7 +475,12 @@ def get_embedding(text: str, ollama_url: str, model: str = DEFAULT_EMBED_MODEL,
     last_error = None
     for attempt in range(max(1, retries + 1)):   # a negative `retries` must not skip the loop
         try:
-            resp = requests.post(f"{ollama_url}/api/embeddings", json=payload, timeout=timeout)
+            try:
+                resp = requests.post(f"{ollama_url}/api/embeddings", json=payload, timeout=timeout)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                # Reaching the backend failed — that says nothing about this input, so it
+                # is raised as a distinct type the heal bookkeeping can act on.
+                raise EmbeddingBackendUnavailable(str(e)) from e
             resp.raise_for_status()
             vector = resp.json().get("embedding") or []
             # Ollama answers 200 with an empty array on some soft failures. Unchecked,
@@ -492,7 +503,30 @@ def get_embedding(text: str, ollama_url: str, model: str = DEFAULT_EMBED_MODEL,
 # silently STALE one — better, but still permanent unless something later comes back for
 # it. Nothing else will: the pull hook only re-embeds files changed in that pull, so a
 # file that failed once is never revisited until it happens to be edited again.
-HEAL_MAX_ATTEMPTS = int(os.getenv("SUMELA_HEAL_MAX_ATTEMPTS", "3"))
+HEAL_MAX_ATTEMPTS = _env_num("SUMELA_HEAL_MAX_ATTEMPTS", 3, 1)
+
+
+def project_scope_should(project: str):
+    """The `should` clause that scopes a filter to one project — the SINGLE definition of
+    "does this point belong to me".
+
+    Combined with a `must`, Qdrant requires the must AND at least one should (verified
+    against a live instance), so this reads as: my points, OR points from before
+    project_slug existed.
+
+    Tolerating unstamped points is not laxity, it is the back-compat path: a collection
+    adopted by `migrate-collections.py` is aliased ZERO-COPY and its payloads are never
+    rewritten, so pre-v0.11.0 points carry no project_slug at all. A strict `must` on the
+    slug silently stops matching them — the delete then misses, the re-upsert lands under
+    a different point id, and every file ends up in the index TWICE, the stale copy
+    holding an embedding of an older revision. (Measured on a live adopted collection:
+    108 unstamped points in code_chunks, 106 in wiki_pages.)
+    """
+    from qdrant_client.models import FieldCondition, MatchValue, IsEmptyCondition, PayloadField
+    return [
+        FieldCondition(key="project_slug", match=MatchValue(value=project)),
+        IsEmptyCondition(is_empty=PayloadField(key="project_slug")),
+    ]
 
 
 def scan_entry_completeness(client, collection: str, id_key: str,
@@ -510,14 +544,15 @@ def scan_entry_completeness(client, collection: str, id_key: str,
     `project` scopes the scan to one project_slug. Collections are namespaced per project
     by default, but the CODE_CHUNKS_COLLECTION override deliberately lets two repos share
     one — and there an unscoped scan reads the OTHER project's paths as "known", so this
-    project's real gaps are never healed.
+    project's real gaps are never healed. Legacy unstamped points count as ours (see
+    `project_scope_should`); scoping them out would report the whole tree as absent and
+    trigger a silent full re-embed on every adopted install.
     """
     have, total, offset = {}, {}, None
     scan_filter = None
     if project:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        scan_filter = Filter(must=[FieldCondition(key="project_slug",
-                                                  match=MatchValue(value=project))])
+        from qdrant_client.models import Filter
+        scan_filter = Filter(should=project_scope_should(project))
     while True:
         points, offset = client.scroll(
             collection_name=collection, limit=page, offset=offset,
@@ -535,6 +570,12 @@ def scan_entry_completeness(client, collection: str, id_key: str,
             break
     incomplete = {i for i, n in have.items() if total.get(i) and n < total[i]}
     return incomplete, set(have)
+
+
+class EmbeddingBackendUnavailable(Exception):
+    """The embedding backend could not be reached — as opposed to it rejecting this
+    input. Callers use the distinction to decide whether a failure says anything about
+    the FILE (strike it) or only about the machine (don't)."""
 
 
 def ollama_preflight(ollama_url: str, timeout: int = 5) -> "str | None":
@@ -590,14 +631,19 @@ def save_heal_state(root: Path, collection: str, state: dict, keep=None) -> None
             state = {k: v for k, v in state.items() if k in set(keep)}
         path = _heal_state_path(root, collection)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, indent=0, sort_keys=True), encoding="utf-8")
+        import tempfile
+        # A FIXED temp name is shared by concurrent writers (the hook ingest and a
+        # manual --heal), so os.replace could publish a torn file — the very thing
+        # this write is supposed to prevent.
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".heal-state-", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=0, sort_keys=True)
         os.replace(tmp, path)
     except Exception:
         pass
 
 
-def apply_heal_outcome(state: dict, attempted, failed) -> dict:
+def apply_heal_outcome(state: dict, attempted, failed, backend_ok: bool = True) -> dict:
     """Fold one heal round into the attempt state.
 
     An entry that heals is forgotten; one that fails again gets a strike. Past
@@ -605,15 +651,19 @@ def apply_heal_outcome(state: dict, attempted, failed) -> dict:
     embed would be retried on every pull forever, invisibly, which is its own silent
     failure. The retirement is reported once by the caller rather than swallowed.
 
-    A round where EVERYTHING failed records nothing. That shape is evidence about the
-    backend, not about the files: a stopped Ollama, a full disk, a wedged Qdrant. Left
-    unguarded it strikes out the entire backlog in three rounds and permanently disables
-    the healer for exactly the files it exists to repair — trading a silent hole for a
-    silent, permanent shutdown. A genuinely unembeddable file still accumulates strikes
-    because its neighbours in the same round succeed.
+    `backend_ok=False` records nothing: a stopped Ollama or a wedged Qdrant is evidence
+    about the BACKEND, not about the files, and striking there retires the whole backlog
+    in three rounds — a silent permanent shutdown replacing a silent hole.
+
+    That signal must come from the CALLER, not from the shape of the outcome. An earlier
+    version inferred it as "everything in this round failed", which is wrong because that
+    shape is the healer's steady state, not an anomaly: files that heal LEAVE the
+    candidate set, so it converges to only-broken files and every round then looks like a
+    total outage. Retirement became unreachable and a lone unembeddable file was immortal
+    — measured, 50 rounds, zero strikes.
     """
     attempted, failed = set(attempted), set(failed)
-    if attempted and failed >= attempted:
+    if not backend_ok:
         return state
     for ident in attempted:
         if ident in failed:

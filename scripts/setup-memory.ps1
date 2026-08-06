@@ -144,8 +144,19 @@ if ((Want "qdrant-session-memory") -and (Test-Path (Join-Path $plugDir "qdrant-s
         $extraDirs = ""
         if (Test-Path (Join-Path $s "resolve-ingest-dirs.py")) { $extraDirs = (& $py (Join-Path $s "resolve-ingest-dirs.py") 2>$null | Out-String).Trim() }
         if ((Test-Path (Join-Path $s "ingest-wiki-to-qdrant.py")) -and ((Test-Path "docs/second-brain/wiki") -or $extraDirs)) {
-            & $py (Join-Path $s "ingest-wiki-to-qdrant.py") *> $null
-            if ($LASTEXITCODE -eq 0) { Ok "Seeded wiki_pages" } else { Info "wiki_pages seeding skipped (will sync on pull)" }
+            # Three-valued exit (mirrors setup-memory.sh): 0 seeded, 2 seeded with some
+            # pages stale, anything else could not run. Collapsing 2 into the failure
+            # branch told the operator seeding was skipped when nearly all of it landed.
+            $wikiLog = (& $py (Join-Path $s "ingest-wiki-to-qdrant.py") 2>&1 | Out-String)
+            switch ($LASTEXITCODE) {
+                0 { Ok "Seeded wiki_pages" }
+                2 {
+                    Info "Seeded wiki_pages, but some pages were skipped — re-run to finish: $py $s/ingest-wiki-to-qdrant.py"
+                    ($wikiLog -split "`n" | Select-String '^\[warn\]' | Select-Object -First 5) |
+                        ForEach-Object { Write-Host "    $_" }
+                }
+                default { Info "wiki_pages seeding skipped (will sync on pull)" }
+            }
         }
         Info "code_chunks left empty — built automatically on the next pull that touches code (or run now: $py $plugDir/qdrant-session-memory/scripts/ingest-code-to-qdrant.py)"
     }
