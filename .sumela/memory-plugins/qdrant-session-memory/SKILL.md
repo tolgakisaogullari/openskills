@@ -102,7 +102,7 @@ These triggers require an explicit user query:
 | `setup-qdrant.py` | Create Qdrant collections | Once during setup |
 | `session-ingest.py` | Ingest session summary | After each context-handoff |
 | `query-qdrant.py` | Semantic search over sessions | On-demand (proactive + reactive) |
-| `ingest-code-to-qdrant.py` | Ingest source code files | AUTO on pull: re-embeds just the changed files (incremental, background, post-merge/post-checkout `sumela_code_sync`); first build / empty collection promotes to a full walk. Force a full re-embed with `SUMELA_PULL_CODE_REINGEST=1`; pass `--changed-file <list>` for a manual incremental run. `--heal` re-ingests entries the index is missing or only partially holds — the hook runs it automatically every 6h; run it by hand if you suspect the index is incomplete |
+| `ingest-code-to-qdrant.py` | Ingest source code files | AUTO on pull: re-embeds just the changed files (incremental, background, post-merge/post-checkout `sumela_code_sync`); first build / empty collection promotes to a full walk. Force a full re-embed with `SUMELA_PULL_CODE_REINGEST=1`; pass `--changed-file <list>` for a manual incremental run |
 | `ingest-wiki-to-qdrant.py` | Ingest wiki pages | After wiki updates; AUTO on pull when a curated page changed (post-merge/post-checkout `sumela_wiki_sync`) |
 | `delete-from-qdrant.py` | Remove a deleted file's points by payload key | Auto on pull for wiki pages / code files removed upstream (orphan pruning) |
 | `lib/memory_ingest.py` | Shared helpers (chunk, embed, ID) | Used by other scripts |

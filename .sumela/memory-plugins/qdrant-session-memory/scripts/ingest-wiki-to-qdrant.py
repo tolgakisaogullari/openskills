@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.memory_ingest import (
     get_repo_root, get_extra_ingest_dirs, chunk_text, get_embedding,
     deterministic_id, print_report, resolve_collection_arg, project_slug,
-    qdrant_client_preflight, EMBED_MAX_WORKERS, ollama_preflight, project_scope_should,
+    qdrant_client_preflight, EMBED_MAX_WORKERS, ollama_preflight,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -295,12 +295,8 @@ def main():
         try:
             client.delete(
                 collection_name=COLLECTION_NAME,
-                # Same scoping as the code twin: WIKI_PAGES_COLLECTION is an identical
-                # shared-collection override, so an unscoped path filter would let one
-                # repo delete another's identically-named page.
                 points_selector=Filter(
-                    must=[FieldCondition(key="page_path", match=MatchValue(value=page_path))],
-                    should=project_scope_should(PROJECT_SLUG),
+                    must=[FieldCondition(key="page_path", match=MatchValue(value=page_path))]
                 ),
             )
         except Exception as e:
@@ -349,7 +345,7 @@ def main():
     # 0 = fully refreshed · 2 = ran, some pages stale · 1 = could not run.
     # See the code-ingest twin for why 2 is separate from 1.
     if failed_pages or upsert_failed:
-        sys.exit(2)   # ran; some pages are stale. See the code-ingest twin.
+        sys.exit(2 if qdrant_ok else 1)   # see the code-ingest twin
     sys.exit(0 if qdrant_ok else 1)
 
 

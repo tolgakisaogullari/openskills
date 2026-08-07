@@ -104,7 +104,7 @@ check can detect a newer upstream via `git ls-remote --tags`.
 ### Fixed
 
 - **Embedding: an over-long chunk killed the Ollama model runner and silently punched
-  holes in the index (v0.12.1).** Field finding from a consuming repo: one ingest run
+  holes in the index (v0.13.0).** Field finding from a consuming repo: one ingest run
   lost **2496 chunks across 617 files** while reporting `SUCCESS`. Ollama loads an
   embedding model with `n_batch = n_ubatch = 2048`, and an embedding model is
   **non-causal** — bidirectional attention needs the whole sequence in ONE ubatch, so
@@ -145,47 +145,6 @@ check can detect a newer upstream via `git ls-remote --tags`.
   runs it) that pins the real measurements, the whitespace-free case, `num_batch` presence
   and the retry contract.
 
-  The bulk-ingest worker count moves to `lib` as `EMBED_MAX_WORKERS`
-  (`SUMELA_EMBED_MAX_WORKERS`, clamped to ≥1) so a memory-constrained host can lower it.
-  The default stays **4 — measured, not assumed**: on 60 real code chunks throughput ran
-  12.3 chunk/s at 1 worker, 21.1 at 2, 24.3 at 4 and 23.9 at 8, so it saturates at 4. The
-  gain holds even with `OLLAMA_NUM_PARALLEL=1` because it is pipelining rather than
-  parallel compute — the next requests are already queued at the server, keeping the HTTP
-  round trip off the critical path. (Concurrency was initially suspected of only
-  multiplying a crash's blast radius; the measurement said otherwise, and the retry plus
-  all-or-nothing changes above address the blast radius directly.)
-
-- **The code index now heals itself — existing damage is repaired with nothing to run by
-  hand (v0.12.1).** The fix above stops NEW damage but cannot repair points already
-  missing, and nothing would have come back for them: the pull hook only re-embeds files
-  changed in that pull, and it excludes `.sumela/`, so **the upgrade itself triggers no
-  re-ingest at all**. Every existing install would have kept a silently incomplete index
-  forever. Worse, the all-or-nothing rule above deliberately leaves a file stale when a
-  chunk fails — the right trade, but permanent without a healer. So the two ship together.
-  - `ingest-code-to-qdrant.py --heal` finds both damage shapes — entries holding fewer
-    points than their own `total_chunks`, and files on disk with no points at all — and
-    feeds them through the existing `--changed-file` path. Damage is **self-identifying**:
-    every point already carries `total_chunks`, so no bookkeeping is needed anywhere else.
-  - The pull/checkout/commit hook runs it automatically, throttled to once per 6h
-    (`SUMELA_HEAL_INTERVAL_SECONDS`) so it costs nothing per commit — and **always due when
-    the marker is absent**, so the first pull after upgrading repairs the backlog. It
-    merges with an incremental run into ONE ingest, so two runs never race the same file.
-  - A file that can never embed is retired after `SUMELA_HEAL_MAX_ATTEMPTS` (3) strikes
-    and reported, instead of being retried on every pull forever — replacing a silent hole
-    with a silent loop would be no better.
-  - An empty collection defers to the existing "promote to FULL" path rather than
-    reporting every file as damaged.
-  - `ingest-wiki-to-qdrant.py` needs no `--heal`: it re-walks every page on each run, so
-    all-or-nothing already makes it self-correcting.
-
-  Measured on a 15.5k-file repo: detection is **0.11 s** (payload-only scroll over 21k
-  points) plus **0.33 s** for the source walk; the first heal there had 404 entries to
-  repair (334 partial, 70 absent). `full_walk` was rewritten for this — it ran one
-  `rglob` per pattern (nine passes) and descended `node_modules/`, `bin/` and `obj/` in
-  every one, costing **6.3 s**; pruning excluded directories during a single `os.walk`
-  gives an identical file set 19x faster, which is what makes a scheduled heal viable. New per-developer state (`.sumela/.heal-last`,
-  `.sumela/.heal-state-*.json`) is added to `scripts/lib/sumela-gitignore.list`, the
-  single source both setup and update reconcile from, so it reaches upgraded installs too.
 
 - **graphify plugin: rebuilds hard-failed without an LLM key on repos with docs (v0.9.1).**
   Field report from a consuming repo (graphify CLI 0.8.35, 308 non-code doc/image files):

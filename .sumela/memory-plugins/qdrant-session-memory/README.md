@@ -33,7 +33,6 @@ All scripts accept CLI arguments and environment variables. CLI args take preced
 | Max tokens per embedded chunk | — | `SUMELA_EMBED_MAX_TOKENS` | 90% of `SUMELA_EMBED_NUM_BATCH` |
 | Seconds to wait before retrying a failed embed | — | `SUMELA_EMBED_RETRY_DELAY` | `2` |
 | Concurrent embed requests during a bulk ingest | — | `SUMELA_EMBED_MAX_WORKERS` | `4` |
-| Failed heal attempts before an entry is retired | — | `SUMELA_HEAL_MAX_ATTEMPTS` | `3` |
 
 `SUMELA_EMBED_NUM_BATCH` is the ceiling Ollama loads the model with; an embedding model is
 non-causal, so a prompt that does not fit in ONE batch aborts the model runner and 500s
@@ -120,7 +119,7 @@ the authoritative source — this captures the session narrative.
 | `setup-qdrant.py` | Create Qdrant collections (idempotent) |
 | `session-ingest.py` | Ingest a session summary markdown into Qdrant (developer/domain/date/spec/plan metadata) |
 | `query-qdrant.py` | Semantic search + developer/domain/date filters (and filter-only listing) over session history |
-| `ingest-code-to-qdrant.py` | Ingest source code into `code_chunks`. `--changed-file <list>` for an incremental run, `--heal` to repair entries the index is missing or only partially holds (the git hook passes this automatically) |
+| `ingest-code-to-qdrant.py` | Ingest source code into `code_chunks`. `--changed-file <list>` for an incremental run |
 | `ingest-wiki-to-qdrant.py` | Ingest wiki pages into `wiki_pages` collection |
 | `lib/memory_ingest.py` | Shared helpers (chunking, embedding, deterministic IDs) |
 
@@ -142,5 +141,5 @@ Exit codes for the two ingest scripts are three-valued — do NOT read non-zero 
 
 A file is ingested **all-or-nothing**: if any of its chunks fails, its existing points are
 left alone. An incomplete entry is worse than a stale one — retrieval would answer
-confidently from a file it only half knows. `--heal` finds and repairs those entries, and
-the git hook runs it on a schedule (see `.sumela/git-hooks/README.md`).
+confidently from a file it only half knows. Re-run the script to finish the job; the
+report names the affected files and the run exits `2`.

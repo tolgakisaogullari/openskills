@@ -9,10 +9,6 @@
 .sumela/.code-chunks-synced
 .sumela/.update-check
 .sumela/.retrieval-cache.json
-.sumela/.heal-last
-.sumela/.heal-state-*.json*
-.sumela/.ingest.lock/
-.sumela/.ingest-pending
 .superpowers/
 **/scripts/.superpowers/
 graphify-out/

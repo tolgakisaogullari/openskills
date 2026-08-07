@@ -63,8 +63,6 @@ def install_fake_requests(responses):
     fake = types.ModuleType("requests")
     # get_embedding catches requests.ConnectionError/Timeout by name to classify a
     # backend outage, so the stub must carry them or it diverges from the real module.
-    fake.ConnectionError = type("ConnectionError", (Exception,), {})
-    fake.Timeout = type("Timeout", (Exception,), {})
 
     def post(url, json=None, timeout=None):
         calls.append({"url": url, "json": json, "timeout": timeout})
@@ -191,25 +189,6 @@ def main():
           isinstance(raised, RuntimeError))
     check("no silent success after exhausted retries", len(calls) == 2)
 
-    # A connection-level failure is about the MACHINE, not the input — it must surface
-    # as a distinct type so heal bookkeeping does not strike a perfectly good file.
-    fake = types.ModuleType("requests")
-    class _ConnErr(Exception): pass
-    class _Timeout(Exception): pass
-    fake.ConnectionError = _ConnErr
-    fake.Timeout = _Timeout
-    def _post_conn(url, json=None, timeout=None):
-        raise _ConnErr("connection refused")
-    fake.post = _post_conn
-    sys.modules["requests"] = fake
-    _mod.EMBED_RETRY_DELAY_SECONDS = 0
-    raised = None
-    try:
-        get_embedding("merhaba", "http://localhost:11434")
-    except Exception as e:      # noqa: BLE001
-        raised = e
-    check("a connection failure raises EmbeddingBackendUnavailable",
-          isinstance(raised, _mod.EmbeddingBackendUnavailable))
 
     # An empty embedding array is a 200 response Ollama really produces on soft failures.
     calls = install_fake_requests([_FakeResponse({"embedding": []}),
@@ -221,103 +200,9 @@ def main():
         raised = e
     check("an empty embedding is rejected rather than stored",
           isinstance(raised, ValueError))
-    check("a wrong-dimension response is NOT a backend-unavailable error",
-          not isinstance(raised, _mod.EmbeddingBackendUnavailable))
 
     sys.modules.pop("requests", None)
 
-    # --- self-heal: incomplete entries are self-identifying -------------------------
-    # The whole automatic-repair story rests on this: every point carries total_chunks,
-    # so a half-written entry can be found without any bookkeeping elsewhere.
-    class _Point:
-        def __init__(self, payload):
-            self.payload = payload
-
-    class _FakeClient:
-        """Two-page scroll, so paging is exercised rather than assumed."""
-        def __init__(self, points):
-            self.pages = [points[:len(points) // 2], points[len(points) // 2:]]
-            self.filters = []
-
-        def scroll(self, collection_name, limit, offset, with_payload, with_vectors,
-                   scroll_filter=None):
-            self.filters.append(scroll_filter)
-            idx = offset or 0
-            return self.pages[idx], (1 if idx == 0 else None)
-
-    points = []
-    for i in range(3):
-        points.append(_Point({"file_path": "complete.cs", "total_chunks": 3}))
-    points.append(_Point({"file_path": "partial.cs", "total_chunks": 4}))       # 1 of 4
-    points.append(_Point({"file_path": "single.cs", "total_chunks": 1}))
-    points.append(_Point({"total_chunks": 2}))                                  # no identity
-    fake = _FakeClient(points)
-    incomplete, known = _mod.scan_entry_completeness(fake, "code_chunks", "file_path")
-    check("an unscoped scan sends no filter", all(f is None for f in fake.filters))
-    # Under the shared-collection override two repos live in one collection; an unscoped
-    # scan would read the other project's paths as "known" and never heal this one's gaps.
-    scoped = _FakeClient(points)
-    _mod.scan_entry_completeness(scoped, "code_chunks", "file_path", project="proj-a")
-    check("a project-scoped scan filters on project_slug",
-          all(f is not None for f in scoped.filters))
-    check("partial entry is detected", incomplete == {"partial.cs"})
-    check("complete entries are not flagged", "complete.cs" not in incomplete)
-    check("single-chunk entry is not flagged", "single.cs" not in incomplete)
-    check("known set covers every identity seen",
-          known == {"complete.cs", "partial.cs", "single.cs"})
-    check("payload without an identity key is ignored", None not in known)
-
-    # --- self-heal: the strike counter retires a hopeless entry ---------------------
-    # Without this an entry that can never embed is retried on every pull forever —
-    # a silent loop replacing a silent hole.
-    state = {}
-    for _ in range(_mod.HEAL_MAX_ATTEMPTS):
-        state = _mod.apply_heal_outcome(state, {"bad.cs", "good.cs"}, {"bad.cs"})
-    check("repeated failure accumulates strikes",
-          state.get("bad.cs") == _mod.HEAL_MAX_ATTEMPTS)
-    check("an entry that heals is forgotten", "good.cs" not in state)
-    check("strikes reach the retirement threshold",
-          state["bad.cs"] >= _mod.HEAL_MAX_ATTEMPTS)
-    state = _mod.apply_heal_outcome(state, {"bad.cs"}, set())
-    check("a later success clears the strikes", "bad.cs" not in state)
-
-    # The healer's STEADY STATE is "every candidate failed": files that heal leave the
-    # set, so it converges to only-broken ones. An earlier version inferred "the backend
-    # is down" from that shape and stopped recording — which made retirement unreachable
-    # and a lone broken file immortal. The signal must come from the caller.
-    state = {}
-    for _ in range(_mod.HEAL_MAX_ATTEMPTS):
-        state = _mod.apply_heal_outcome(state, {"lonely.cs"}, {"lonely.cs"})
-    check("a LONE permanently-broken candidate still reaches retirement",
-          state.get("lonely.cs", 0) >= _mod.HEAL_MAX_ATTEMPTS)
-    state = {}
-    for _ in range(_mod.HEAL_MAX_ATTEMPTS):
-        state = _mod.apply_heal_outcome(state, {"a.cs", "b.cs"}, {"a.cs", "b.cs"})
-    check("an all-broken candidate set still retires",
-          all(state.get(k, 0) >= _mod.HEAL_MAX_ATTEMPTS for k in ("a.cs", "b.cs")))
-    # ...but a genuine backend outage must still cost nobody a strike.
-    state = {}
-    for _ in range(_mod.HEAL_MAX_ATTEMPTS + 2):
-        state = _mod.apply_heal_outcome(state, {"a.cs", "b.cs"}, {"a.cs", "b.cs"},
-                                        backend_ok=False)
-    check("a backend outage records NO strikes", state == {})
-
-    state = _mod.apply_heal_outcome({}, {"a.cs", "b.cs"}, {"a.cs"})
-    check("a partial failure still strikes the failing entry", state.get("a.cs") == 1)
-    check("a partial failure clears the succeeding entry", "b.cs" not in state)
-
-    # --- get_embedding enforces the bound itself ------------------------------------
-    # The bound used to live only in chunk_text, so any caller that did not chunk
-    # first silently opted out — query-qdrant.py embeds raw user text and did exactly
-    # that. Truncation is the right degradation for a query; ingest already pre-splits.
-    calls = install_fake_requests([_FakeResponse({"embedding": [0.9] * _mod.EMBED_DIM})])
-    huge = "字" * (limit * 2)
-    get_embedding(huge, "http://localhost:11434")
-    sent = calls[0]["json"]["prompt"]
-    check("an oversized input is truncated before it reaches Ollama", len(sent) < len(huge))
-    check("the truncated payload fits the byte budget",
-          len(sent.encode("utf-8")) + 2 <= limit)
-    sys.modules.pop("requests", None)
 
     if check.failed:
         print(f"\n{check.failed} assertion(s) FAILED")

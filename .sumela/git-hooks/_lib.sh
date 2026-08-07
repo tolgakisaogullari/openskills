@@ -31,7 +31,6 @@
 #   export SUMELA_DISABLE_WIKI_SYNC=1     # Qdrant wiki_pages                (default on)
 #   export SUMELA_DISABLE_CODE_SYNC=1     # Qdrant code_chunks: off entirely (no prune/embed)
 #   export SUMELA_PULL_CODE_REINGEST=1    # Qdrant code_chunks: force a FULL tree re-embed
-#   export SUMELA_HEAL_INTERVAL_SECONDS=N # seconds between index self-heal passes (6h)
 #   export SUMELA_DISABLE_UPDATE_CHECK=1  # don't probe upstream for a newer SumelaOS release
 # Override paths/endpoints: SUMELA_SUMMARIES_DIR, WIKI_PATH, QDRANT_HOST, QDRANT_PORT
 
@@ -435,39 +434,6 @@ sumela_wiki_sync() {  # $1 = "from" ref, $2 = "to" ref
 #     promotes the run to a FULL tree build so the whole corpus gets indexed once.
 #   SUMELA_PULL_CODE_REINGEST=1 forces a FULL tree re-embed instead of incremental.
 #   Disable everything (no prune, no embed): SUMELA_DISABLE_CODE_SYNC=1
-# Is a self-heal pass due? The healer is cheap (a payload-only scroll plus a source walk,
-# ~1.2s measured) but this function runs on every commit AND checkout AND merge, so an
-# unthrottled heal would fork a process per commit for no benefit — index damage does not
-# appear between two commits a minute apart. The epoch is stored IN the marker file rather
-# than read from its mtime, which keeps this portable (no stat -c vs stat -f split). A
-# MISSING marker means "never healed" and is therefore due, so the first pull after an
-# upgrade repairs whatever the previous version left behind with nothing to run by hand.
-_sumela_heal_due() {  # $1 = install root
-  local marker="$1/.sumela/.heal-last"
-  local interval="${SUMELA_HEAL_INTERVAL_SECONDS:-21600}"   # 6h
-  # A non-numeric override (`=6h` is the obvious mistake) would make `[` print
-  # "integer expression expected" into EVERY git command and return 2 — read as
-  # "not due", silently disabling healing forever. Fall back instead.
-  case "$interval" in ''|*[!0-9]*) interval=21600 ;; esac
-  [ -f "$marker" ] || return 0
-  local now last
-  now="$(date +%s 2>/dev/null)" || return 1
-  last="$(cat "$marker" 2>/dev/null)"
-  case "$last" in ''|*[!0-9]*) return 0 ;; esac
-  [ $(( now - last )) -ge "$interval" ]
-}
-
-# Returns non-zero when the marker could NOT be written. Two subtleties, both learned
-# the hard way: `cmd > file 2>/dev/null` silences the COMMAND, not the redirection, so
-# an unwritable path still prints "No such file or directory" into every git checkout —
-# the redirect must be inside a group for the suppression to cover it. And swallowing
-# the failure would leave the throttle permanently un-armed, forking a background
-# ingest on every git operation; the caller skips the heal instead, because an
-# unthrottleable heal is worse than a postponed one.
-_sumela_heal_mark() {  # $1 = install root
-  { date +%s > "$1/.sumela/.heal-last"; } 2>/dev/null
-}
-
 sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
   local from="$1" to="$2"
   [ -n "${SUMELA_DISABLE_CODE_SYNC:-}" ] && return 0
@@ -488,20 +454,9 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
       "${install_rel:-.}" ":(exclude)${scope}docs" ":(exclude)${scope}.sumela" 2>/dev/null)"
   deleted="$(git -C "$repo" -c core.quotePath=false diff --name-only --diff-filter=D "$from" "$to" -- \
       "${install_rel:-.}" ":(exclude)${scope}docs" ":(exclude)${scope}.sumela" 2>/dev/null)"
-  # A heal pass is worth running even when this ref range touched no code at all — that
-  # is exactly the shape of a SumelaOS upgrade (it only writes under .sumela/, which is
-  # excluded above), and the whole point is that the upgrade repairs the damage the
-  # previous version left without the developer doing anything.
-  local heal=""
-  _sumela_heal_due "$install" && heal=1
-  [ -n "$changed$deleted$heal" ] || return 0
+  [ -n "$changed$deleted" ] || return 0
 
-  if ! _sumela_qdrant_up; then
-    # Only worth saying out loud when there was real work to skip; a quiet heal tick on
-    # an unrelated commit must not add a line to every pull.
-    [ -n "$changed$deleted" ] && echo "sumela: code_chunks sync skipped (Qdrant not reachable)"
-    return 0
-  fi
+  _sumela_qdrant_up || { echo "sumela: code_chunks sync skipped (Qdrant not reachable)"; return 0; }
 
   local log="$install/.sumela/.memory-sync.log"
 
@@ -514,15 +469,15 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
     ) >>"$log" 2>&1 </dev/null &
   fi
 
-  # RE-EMBED — when code was added/modified, or when a heal pass is due.
-  [ -n "$changed$heal" ] || return 0
+  # RE-EMBED — only when code was added/modified.
+  [ -n "$changed" ] || return 0
 
   # SUMELA_PULL_CODE_REINGEST=1 -> full tree re-embed; otherwise incremental on just
   # the changed files. The changed list is handed to the ingest script via a temp
   # file (robust for any number of paths and detached background stdin).
   local full="${SUMELA_PULL_CODE_REINGEST:-}"
   local changed_list=""
-  if [ -z "$full" ] && [ -n "$changed" ]; then
+  if [ -z "$full" ]; then
     changed_list="$(mktemp 2>/dev/null)" || changed_list=""
     if [ -n "$changed_list" ]; then
       printf '%s\n' "$changed" >"$changed_list"
@@ -531,108 +486,22 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
     fi
   fi
 
-  # Announce real work only. A due heal on a pull that changed no code stays silent
-  # here and reports into the log — it needs no decision from the developer, and a line
-  # on every pull would train them to ignore this channel.
   if [ -n "$full" ]; then
     echo "sumela: re-embedding the full source tree into Qdrant code_chunks in background (log: .sumela/.memory-sync.log)"
-  elif [ -n "$changed" ]; then
+  else
     echo "sumela: re-embedding $(printf '%s\n' "$changed" | grep -c .) changed code file(s) into Qdrant code_chunks in background (incremental; log: .sumela/.memory-sync.log)"
   fi
 
-  # A heal-only run against a pre-0.12.1 ingest would die on `unrecognized arguments`,
-  # and because both jobs share one invocation that would take the incremental re-embed
-  # down with it. Probe --help rather than grepping the source: a Usage docstring
-  # mentioning the flag would satisfy a text match while argparse still rejects it.
-  if [ -n "$heal" ] && ! python3 "$ingest" --help 2>/dev/null | grep -q -- '--heal'; then
-    heal=""
-  fi
-  [ -n "$changed$full$heal" ] || return 0
-
   ( trap '[ -n "$changed_list" ] && rm -f "$changed_list"' EXIT   # clean up even if cd below fails
     cd "$install" || exit 0
-    # One ingest at a time per install. Merging heal into the incremental invocation
-    # only serialises work within ONE hook call; a heal can run for minutes, so the
-    # NEXT commit's incremental run would otherwise delete-then-upsert the same file
-    # paths concurrently and the slower run would win with staler content.
-    lock="$install/.sumela/.ingest.lock"
-    pend="$install/.sumela/.ingest-pending"
-    if ! mkdir "$lock" 2>/dev/null; then
-      # Distinguish "held" from "cannot create at all" (read-only FS, ENOSPC): treating
-      # the latter as contention would claim another ingest is running, forever.
-      [ -d "$lock" ] || { echo "===== code-sync: cannot create $lock — skipping ====="; exit 0; }
-      # A live holder refreshes nothing, so age alone would declare a legitimate 2h+
-      # full build stale and start a second ingest beside it. Reclaim only when the
-      # recorded owner is gone.
-      holder="$(cat "$lock/pid" 2>/dev/null)"
-      stale=0
-      case "$holder" in
-        ''|*[!0-9]*) stale=1 ;;                       # no/garbage owner — treat as abandoned
-        *) kill -0 "$holder" 2>/dev/null || stale=1 ;;
-      esac
-      # Owner still alive but the lock is ancient: a wedged process. A real full build
-      # is minutes, so 12h can only mean stuck. (Also covers a recycled PID that now
-      # belongs to an unrelated long-lived process, which would otherwise block forever.)
-      if [ "$stale" -eq 0 ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +720 2>/dev/null)" ]; then
-        stale=1
-      fi
-      if [ "$stale" -eq 1 ]; then
-        # rename(2) is atomic, so exactly ONE racer can claim the stale dir. rmdir+mkdir
-        # let a second racer delete the winner's FRESH lock and take it too. rm -rf, not
-        # rmdir: a stray .DS_Store inside must not wedge sync permanently.
-        gone="$lock.stale.$$"
-        mv "$lock" "$gone" 2>/dev/null || exit 0
-        rm -rf "$gone" 2>/dev/null
-        mkdir "$lock" 2>/dev/null || exit 0
-        echo "===== code-sync: reclaimed an abandoned lock ====="
-      else
-        # Do NOT discard the work: heal only finds MISSING or PARTIAL entries, so a
-        # modified file whose re-embed is dropped keeps its old, complete-looking chunks
-        # and nothing ever repairs it. Park the paths for the next run instead.
-        if [ -n "$changed_list" ]; then
-          cat "$changed_list" >>"$pend" 2>/dev/null \
-            && echo "===== code-sync: deferred $(grep -c . "$changed_list") file(s) to .ingest-pending ====="
-        else
-          echo "===== code-sync: deferred, another ingest holds $lock ====="
-        fi
-        exit 0
-      fi
-    fi
-    echo $$ > "$lock/pid" 2>/dev/null
-    trap 'rmdir "$lock" 2>/dev/null || rm -rf "$lock" 2>/dev/null
-          [ -n "$changed_list" ] && rm -f "$changed_list"' EXIT
-    # Fold in anything a contended earlier run parked. The backlog is cleared only
-    # AFTER the ingest actually ran — clearing it up front would lose those paths for
-    # good if this run then failed to start.
-    merged_pending=0
-    if [ -s "$pend" ] && [ -n "$changed_list" ]; then
-      cat "$pend" >>"$changed_list" && merged_pending=1
-      sort -u "$changed_list" -o "$changed_list" 2>/dev/null
-    fi
-    # Arm the throttle only now — doing it before the lock burned the 6h window on a
-    # heal that never ran.
-    [ -n "$heal" ] && _sumela_heal_mark "$install"
     echo "===== code-sync(ingest) @ $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) ====="
-    ok=0
+    local ok=0
     if [ -n "$full" ]; then
-      python3 "$ingest" || ok=$?
-    elif [ -n "$changed_list" ]; then
-      python3 "$ingest" --changed-file "$changed_list" ${heal:+--heal} || ok=$?
+      python3 "$ingest" || ok=1
     else
-      python3 "$ingest" --heal || ok=$?
+      python3 "$ingest" --changed-file "$changed_list" || ok=1
     fi
-    # 2 = ran, some entries stale (re-run will finish them); anything else non-zero
-    # means it could not run. Flattening the two trains people to ignore the channel.
-    if [ "$ok" = 2 ]; then
-      echo "NOTE: code ingest completed with stale entries (see the report above)"
-    elif [ "$ok" -ne 0 ]; then
-      echo "WARN: code ingest failed (rc=$ok)"
-    fi
-    # 0 and 2 both mean the run happened, so the parked paths were processed. Any other
-    # code means it never started — keep the backlog for the next attempt.
-    if [ "$merged_pending" -eq 1 ] && { [ "$ok" = 0 ] || [ "$ok" = 2 ]; }; then
-      : >"$pend"
-    fi
+    [ "$ok" -ne 0 ] && echo "WARN: code ingest failed"
     echo "===== code-sync: done ====="
   ) >>"$log" 2>&1 </dev/null &
   return 0

@@ -79,8 +79,6 @@ developer runs it once per clone.
 | `SUMELA_DISABLE_MEMORY_SYNC` | (unset) | Set to `1` to disable the memory-sync hooks for your clone |
 | `SUMELA_DISABLE_UPDATE_CHECK` | (unset) | Set to `1` to stop the pull-time "newer SumelaOS available" check (see below) |
 | `SUMELA_UPDATE_CHECK_INTERVAL` | `86400` | Seconds between upstream version probes (default once/day) |
-| `SUMELA_HEAL_INTERVAL_SECONDS` | `21600` | Seconds between index self-heal passes (default 6h). The heal repairs `code_chunks` entries the index is missing or only partially holds; it is skipped when the last pass is newer than this. A non-numeric value falls back to the default |
-| `SUMELA_HEAL_MAX_ATTEMPTS` | `3` | Failed heal attempts before an entry stops being retried automatically |
 | `SUMELA_SUMMARIES_DIR` | `$WIKI_PATH/session-summaries` | Where session summaries live |
 | `WIKI_PATH` | `docs/second-brain/wiki` | Wiki root |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Qdrant endpoint |

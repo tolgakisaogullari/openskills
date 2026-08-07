@@ -128,48 +128,13 @@ if command -v python3 >/dev/null 2>&1; then
   # Embedding input bounds: an over-long prompt aborts the Ollama model runner, which
   # 500s every concurrent request too — silently losing chunks from the index.
   if python3 "$REPO_ROOT/tests/test_embedding_bounds.py" >"$WORK/embed_bounds.log" 2>&1; then
-    ok "embedding bounds: token cap, num_batch, retry, self-heal detection"
+    ok "embedding bounds: byte-based token cap, num_batch, retry"
   else
     bad "embedding bounds unit test failed"; sed 's/^/    /' "$WORK/embed_bounds.log" | tail -20
   fi
+else
+  echo "  SKIP  get_repo_root + extra-ingest unit tests (python3 unavailable)"
 fi
-
-# Self-heal throttle: the healer runs from post-commit/checkout/merge, so it must be
-# rate-limited (no process per commit) yet ALWAYS due on a fresh install — that is what
-# makes an upgrade repair the previous version's damage with nothing to run by hand.
-HEALDIR="$WORK/healcheck"; mkdir -p "$HEALDIR/.sumela"
-# Pin the interval explicitly: a developer with this exported would otherwise
-# flip the "throttled" and "due again" assertions below.
-SUMELA_HEAL_INTERVAL_SECONDS=21600
-sed -n '/^_sumela_heal_due()/,/^}/p;/^_sumela_heal_mark()/,/^}/p' \
-  "$REPO_ROOT/.sumela/git-hooks/_lib.sh" >"$WORK/heal_fns.sh"
-# shellcheck source=/dev/null
-. "$WORK/heal_fns.sh"
-if _sumela_heal_due "$HEALDIR"; then ok "heal due when never run (fresh install / post-upgrade)"
-else bad "heal should be due when the marker is absent"; fi
-_sumela_heal_mark "$HEALDIR"
-if _sumela_heal_due "$HEALDIR"; then bad "heal should NOT be due right after a run"
-else ok "heal throttled right after a run (no process per commit)"; fi
-echo "$(( $(date +%s) - 25200 ))" >"$HEALDIR/.sumela/.heal-last"
-if _sumela_heal_due "$HEALDIR"; then ok "heal due again after the interval elapses"
-else bad "heal should be due once the interval has elapsed"; fi
-echo "not-a-number" >"$HEALDIR/.sumela/.heal-last"
-if _sumela_heal_due "$HEALDIR"; then ok "corrupt marker fails OPEN (heals rather than stalls)"
-else bad "corrupt marker must not disable healing"; fi
-# A non-numeric interval must not print "integer expression expected" into every git
-# command, nor silently disable healing by returning 2.
-HEAL_ERR="$(SUMELA_HEAL_INTERVAL_SECONDS=6h _sumela_heal_due "$HEALDIR" 2>&1)"
-if [ -z "$HEAL_ERR" ]; then ok "non-numeric interval produces no shell error"
-else bad "non-numeric interval leaked to stderr: $HEAL_ERR"; fi
-# An unwritable marker must stay SILENT (the redirect, not just the command, has to be
-# suppressed) and must REPORT failure so the caller can drop an unthrottleable heal.
-MARK_ERR="$(_sumela_heal_mark "$WORK/definitely/not/here" 2>&1)"; MARK_RC=$?
-if [ -z "$MARK_ERR" ]; then ok "unwritable marker prints nothing to the terminal"
-else bad "unwritable marker leaked to stderr: $MARK_ERR"; fi
-if [ "$MARK_RC" -ne 0 ]; then ok "unwritable marker reports failure (heal is dropped, not unthrottled)"
-else bad "unwritable marker must return non-zero"; fi
-
-
 
 echo ""
 echo "Run 2 — idempotency (re-run must not duplicate)"

@@ -10,11 +10,6 @@ Usage:
     # path per line). Used by the pull-time hook so code search stays fresh cheaply:
     python ...ingest-code-to-qdrant.py --changed-file /tmp/changed.txt
 
-    # HEAL — re-ingest entries the index is missing or only partially holds. The git
-    # hook passes this on a schedule; run it by hand if you suspect the index is
-    # incomplete. Combines with --changed-file into a single run:
-    python ...ingest-code-to-qdrant.py --heal
-
 What it does:
     1. Selects code files (.cs, .ts, .tsx, .py, .go, .rs, .java, .js, .jsx):
          * FULL        — walks src/ recursively.
@@ -47,7 +42,6 @@ Environment:
     CODE_PATTERNS defaults to *.cs,*.ts,*.tsx,*.py,*.go,*.rs,*.java,*.js,*.jsx
     SUMELA_EMBED_NUM_BATCH / _MAX_TOKENS / _MAX_WORKERS / _RETRY_DELAY — see
       lib.memory_ingest and the plugin README's Configuration table
-    SUMELA_HEAL_MAX_ATTEMPTS defaults to 3 (failed heals before an entry is retired)
 
 Exit codes: 0 = index fully refreshed · 2 = ran, some entries left stale (re-run) ·
 1 = could not run (Qdrant/Ollama unreachable).
@@ -61,9 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.memory_ingest import (
     get_repo_root, chunk_text, get_embedding, deterministic_id, print_report,
     resolve_collection_arg, project_slug, qdrant_client_preflight, EMBED_MAX_WORKERS,
-    scan_entry_completeness, load_heal_state, save_heal_state, apply_heal_outcome,
-    HEAL_MAX_ATTEMPTS, ollama_preflight, EMBED_DIM, project_scope_should,
-    EmbeddingBackendUnavailable,
+    ollama_preflight, EMBED_DIM,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -129,6 +121,11 @@ DISTANCE = Distance.COSINE
 
 REPO_ROOT = get_repo_root()
 SRC_DIR = REPO_ROOT / os.getenv("SRC_DIR", "src")
+# Containment is anchored on the RESOLVED source root, not the repo root: a
+# symlinked src/ (routine in monorepos) resolves outside REPO_ROOT, and anchoring
+# there made every file fail the check — the walk returned nothing while the run
+# reported SUCCESS. Anchoring here still blocks an escape out of the source tree.
+SRC_RESOLVED = SRC_DIR.resolve()
 CODE_PATTERNS = tuple(
     p.strip()
     for p in os.getenv(
@@ -178,8 +175,8 @@ def should_skip_file(file_path: Path) -> bool:
     Directory exclusions are matched against the REPO-RELATIVE parts. Matching absolute
     parts meant a clone living under any directory named build/, dist/, venv/, obj/ or
     node_modules/ excluded its own entire tree — ingesting nothing, silently. That was
-    survivable when a full walk only ran on a manual rebuild; the healer runs one on a
-    schedule, so it would be a permanent silent no-op.
+    survivable when a full walk only ran on a manual rebuild, but a silent no-op is
+    never the right failure mode for an index.
     """
     name = file_path.name
     try:
@@ -219,14 +216,7 @@ def ensure_collection(client: QdrantClient) -> bool:
         print(f"[info] created collection '{COLLECTION_NAME}' ({EMBED_DIM}-dim, {DISTANCE})")
         return True
     try:
-        # Scoped like every other read: under a shared collection an unscoped count sees
-        # the OTHER project's points, so a project with nothing indexed reads as
-        # non-empty and skips the "nothing to heal" guard — landing in a silent
-        # full-tree re-embed, the exact outcome that guard exists to prevent.
-        return client.count(
-            collection_name=COLLECTION_NAME, exact=False,
-            count_filter=Filter(should=project_scope_should(PROJECT_SLUG)),
-        ).count == 0
+        return client.count(collection_name=COLLECTION_NAME, exact=False).count == 0
     except Exception:
         # Collection exists but count failed — don't guess a full re-embed; let the
         # incremental list drive the work.
@@ -239,8 +229,8 @@ def full_walk() -> List[Path]:
     Prunes excluded directories DURING the walk rather than filtering afterwards: the
     previous form ran one `rglob` per pattern (nine passes) and descended `node_modules/`,
     `bin/`, `obj/` and `.venv/` in every one of them. That was tolerable when a full walk
-    only happened on an explicit rebuild; the healer now runs it on a schedule, so on a
-    JS monorepo it would have been tens of seconds of disk I/O per heal.
+    is run on every first build and manual refresh; on a JS monorepo the old form cost
+    tens of seconds of pointless disk I/O.
     """
     code_files: List[Path] = []
     for dirpath, dirnames, filenames in os.walk(SRC_DIR, followlinks=False):
@@ -259,7 +249,7 @@ def full_walk() -> List[Path]:
             if fp.is_symlink():
                 continue
             rp = fp.resolve()
-            if rp != REPO_ROOT and REPO_ROOT not in rp.parents:
+            if rp != SRC_RESOLVED and SRC_RESOLVED not in rp.parents:
                 continue
             code_files.append(fp)
     return sorted(set(code_files))
@@ -297,29 +287,6 @@ def incremental_select(changed_file: Path) -> List[Path]:
     return sorted(out)
 
 
-def heal_select(client) -> "tuple[List[Path], int]":
-    """Files the index is missing or only half knows. Returns (files, retired_count).
-
-    Two failure shapes, both invisible without this: an entry with fewer points than its
-    own `total_chunks` (a run died part-way through the file), and a file on disk with no
-    points at all (every chunk failed). Entries that have already used up
-    HEAL_MAX_ATTEMPTS are retired from the rotation so a permanently-unembeddable file
-    cannot spin on every pull forever.
-    """
-    incomplete, known = scan_entry_completeness(client, COLLECTION_NAME, "file_path",
-                                                project=PROJECT_SLUG)
-    on_disk = {}
-    for path in full_walk():
-        if not should_skip_file(path):
-            on_disk[path.relative_to(REPO_ROOT).as_posix()] = path
-    absent = set(on_disk) - known
-    candidates = (incomplete | absent) & set(on_disk)
-
-    state = load_heal_state(REPO_ROOT, COLLECTION_NAME)
-    retired = {c for c in candidates if state.get(c, 0) >= HEAL_MAX_ATTEMPTS}
-    return sorted(on_disk[c] for c in candidates - retired), len(retired)
-
-
 def main():
     parser = argparse.ArgumentParser(description="Ingest source code into Qdrant code_chunks.")
     parser.add_argument(
@@ -327,12 +294,6 @@ def main():
         default=None,
         help="Path to a file of newline-separated repo-relative paths to ingest "
              "incrementally. Omit for a full src/ walk.",
-    )
-    parser.add_argument(
-        "--heal",
-        action="store_true",
-        help="Also re-ingest files the index is missing or only partially holds. "
-             "Combines with --changed-file into ONE run.",
     )
     args = parser.parse_args()
 
@@ -355,45 +316,25 @@ def main():
 
     # Embedding is the expensive half and the one that fails silently — check it before
     # building any work, so a stopped Ollama costs one HTTP call instead of hours of
-    # retry sleeps, and records no heal strikes against files that are perfectly fine.
+    # retry sleeps in a background process nobody is watching.
     ollama_down = ollama_preflight(OLLAMA_URL)
     if ollama_down:
         report_failure("Dependency", ollama_down)
         sys.exit(1)
 
-    incremental = args.changed_file is not None or args.heal
-    # An empty collection is not damage to heal — it is a first build. A run that was
-    # ASKED to do incremental work promotes to a full build; a heal-only run must NOT,
-    # or an ordinary branch switch on a fresh/wiped index silently embeds the whole tree
-    # in the background with nothing on screen to explain the machine getting busy.
+    incremental = args.changed_file is not None
+    # An empty collection means a first build: promote an incremental request to a
+    # full walk so the whole corpus gets indexed once.
     if incremental and empty:
-        if args.heal and not args.changed_file:
-            print(f"[info] '{COLLECTION_NAME}' is empty — nothing to heal "
-                  f"(a first build runs on the next code change, or run this script with no flags)")
-            report_success(0, 0, True, "heal")
-            sys.exit(0)
         print(f"[info] '{COLLECTION_NAME}' is empty — promoting incremental run to a full build")
         incremental = False
 
-    heal_paths: List[Path] = []
+    mode = "incremental" if incremental else "full"
+
     if incremental:
-        code_files = incremental_select(Path(args.changed_file)) if args.changed_file else []
-        if args.heal:
-            heal_paths, retired = heal_select(client)
-            if retired:
-                print(f"[warn] {retired} file(s) have failed {HEAL_MAX_ATTEMPTS} heal attempts "
-                      f"and are no longer retried automatically — see {COLLECTION_NAME} "
-                      f"heal state under .sumela/")
-            if heal_paths:
-                print(f"[info] healing {len(heal_paths)} file(s) missing or partially indexed")
-            # ONE run: a pull that both changed code and found damage must not race two
-            # ingests over the same collection.
-            code_files = sorted(set(code_files) | set(heal_paths))
-        mode = "heal" if args.heal and not args.changed_file else "incremental"
+        code_files = incremental_select(Path(args.changed_file))
     else:
-        mode = "full"
         if not SRC_DIR.exists():
-            # Nothing to ingest (no source tree) — not an error.
             report_success(0, 0, True, mode)
             sys.exit(0)
         code_files = full_walk()
@@ -425,18 +366,6 @@ def main():
             all_jobs.append((rel_path, file_type, i, chunk, len(chunks)))
 
     if not all_jobs:
-        # Heal candidates that yield no chunks at all (empty or fully filtered) still
-        # count as attempts — otherwise they are re-detected as "absent" on every pull
-        # and the healer churns on them forever.
-        if args.heal and heal_paths:
-            attempted = {p.relative_to(REPO_ROOT).as_posix() for p in heal_paths}
-            # No chunks at all (empty or fully filtered) is a property of the FILE, so
-            # it strikes — otherwise such a file is re-detected as absent on every pull
-            # and the healer churns on it forever.
-            save_heal_state(REPO_ROOT, COLLECTION_NAME,
-                            apply_heal_outcome(load_heal_state(REPO_ROOT, COLLECTION_NAME),
-                                               attempted, attempted, backend_ok=True),
-                            keep=attempted)
         report_success(0, 0, True, mode)
         sys.exit(0)
 
@@ -458,12 +387,9 @@ def main():
                 embedding_map[key] = e
 
     # Group by rel_path for idempotent delete + upsert. A file is ALL-OR-NOTHING:
-    # see the skip loop below. backend_ok distinguishes "this file cannot embed" from
-    # "the machine could not reach Ollama" — only the former may cost a heal strike.
+    # see the skip loop below.
     files = {}
     failed_files = {}
-    backend_ok = not any(isinstance(e, EmbeddingBackendUnavailable)
-                         for e in embedding_map.values() if isinstance(e, Exception))
     for rel_path, file_type, i, chunk, total in all_jobs:
         key = (rel_path, i)
         emb = embedding_map.get(key)
@@ -502,13 +428,8 @@ def main():
         try:
             client.delete(
                 collection_name=COLLECTION_NAME,
-                # Scoped so a shared collection (CODE_CHUNKS_COLLECTION override) cannot
-                # have one repo delete another's identically-named file — but tolerant of
-                # legacy unstamped points, or the delete misses them and every file ends
-                # up duplicated. See project_scope_should.
                 points_selector=Filter(
-                    must=[FieldCondition(key="file_path", match=MatchValue(value=rel_path))],
-                    should=project_scope_should(PROJECT_SLUG),
+                    must=[FieldCondition(key="file_path", match=MatchValue(value=rel_path))]
                 ),
             )
         except Exception as e:
@@ -546,19 +467,6 @@ def main():
             print(f"[warn] upsert failed for {rel_path}: {e} — its points were deleted "
                   f"and NOT replaced; re-run to restore")
 
-    if args.heal and heal_paths:
-        # "Unresolved" is anything we tried to heal that did NOT end up upserted — a
-        # failed embed, a failed upsert, or a file that yields no chunks at all (empty
-        # or filtered). All three would otherwise be re-detected on every single pull;
-        # the strike counter retires them instead of churning forever.
-        attempted = {p.relative_to(REPO_ROOT).as_posix() for p in heal_paths}
-        # keep= bounds the file to what is still a candidate; strikes for files since
-        # deleted from disk would otherwise accumulate forever.
-        save_heal_state(REPO_ROOT, COLLECTION_NAME,
-                        apply_heal_outcome(load_heal_state(REPO_ROOT, COLLECTION_NAME),
-                                           attempted, attempted - upserted_ok,
-                                           backend_ok=backend_ok),
-                        keep=attempted)
 
     qdrant_ok = total_chunks > 0
     report_success(files_ingested, total_chunks, qdrant_ok, mode,
@@ -570,10 +478,10 @@ def main():
     #   2 = ran, but some entries are NOT up to date (re-run to finish)
     #   1 = could not run / nothing ingested
     if failed_files or upsert_failed:
-        # It RAN — the preflights passed — some entries are just not up to date. Telling
-        # the operator "could not run, fix the dependency" would send them chasing a
-        # backend that is fine.
-        sys.exit(2)
+        # It RAN — the preflights passed — so "could not run, fix the dependency" would
+        # send the operator chasing a healthy backend. But when NOTHING landed, "some
+        # entries are stale" understates it just as badly, so that stays 1.
+        sys.exit(2 if qdrant_ok else 1)
     sys.exit(0 if qdrant_ok else 1)
 
 
