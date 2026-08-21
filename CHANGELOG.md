@@ -11,6 +11,12 @@ check can detect a newer upstream via `git ls-remote --tags`.
 
 ### Added
 
+- **`SUMELA_GRAPHIFY_VIZ` (v0.14.0)** — opt back in to graphify's interactive `graph.html` on the
+  pull-time graph refresh when the graph is above graphify's ~5000-node viz limit. Unset by
+  default (see the `Fixed` entry below for why forcing it was removed). Only an affirmative value
+  turns it on: `0`, `false`, `no` and `off` all read as off, so a stale export cannot silently
+  restore the cost. Documented in `.sumela/git-hooks/README.md` and the graphify plugin README.
+
 - **Self-activating bootstrap on `@`-attach — reliable opt-in adoption without auto-loading
   (v0.12.0).** Field finding from a multi-IDE project where not every developer uses SumelaOS:
   attaching `.sumela/sumela-prompt.md` to a turn via `@`-reference did NOT run
@@ -102,6 +108,52 @@ check can detect a newer upstream via `git ls-remote --tags`.
   drift). Eager-layer growth: 18 lines added / 7 replaced (net +11).
 
 ### Fixed
+
+- **The pull-time graph sync no longer forces an unreadable `graph.html` (v0.14.0).** Field
+  finding from a consuming repo: every `git pull` that touched code pinned a core for minutes.
+  The cause was not the graph rebuild — `graphify update`'s AST extraction is already parallel
+  (`ProcessPoolExecutor`, workers = `cpu_count`) — but what SumelaOS did *after* it. graphify
+  skips the interactive `graph.html` above its ~5000-node viz limit; both
+  `auto-update-memory.py` and `setup-memory.{sh,ps1}` treated that skip as an incomplete build,
+  raised `GRAPHIFY_VIZ_NODE_LIMIT` above the real node count, and re-ran `graphify cluster-only .`
+  to force it. That is a **second full Louvain pass plus a huge HTML write on every pull**:
+  measured on a 193k-node / 305k-edge repo, **~226 MB** of HTML that no browser can open, with
+  clustering — single-threaded by nature, no flag parallelizes it — run twice.
+
+  Nothing in the retrieval path reads that file. Tier-2 is `query-graph.py`, which reads
+  `graph.json`; the `graphify-insights` wiki page is generated from `GRAPH_REPORT.md`. The viz
+  was pure cost. The forcing is removed in all three places and **success now gates on
+  `graph.json`** — the artifact the query path actually consumes — with the skipped viz reported
+  as a NOTE (`INFO`, not `WARN`/`todo`: on a large repo it is the expected outcome, not a chore).
+  Small repos are unaffected: under the limit graphify still writes the viz natively and that
+  path still reports "incl. interactive graph.html".
+
+  The capability is kept as an opt-in rather than deleted: `SUMELA_GRAPHIFY_VIZ=1` restores the
+  forced regeneration for the pull-time sync, and the exact manual command
+  (`GRAPHIFY_VIZ_NODE_LIMIT=<nodes+1000> graphify cluster-only .`) is printed in the note. Only a
+  non-empty value other than `0` enables it, so a stale `SUMELA_GRAPHIFY_VIZ=0` in a shell profile
+  cannot silently re-enable the cost.
+
+  **The success gate is `graph.json` AND a zero exit code, not the artifact alone.** The review
+  panel caught a first cut of this change that dropped the `build_rc`/`$built` term from
+  `setup-memory.{sh,ps1}`: a failed `graphify update` running over a *stale* `graph.json` from an
+  earlier build would then have printed "Code graph built" and "Nothing left to do by hand", and
+  on a large repo — where `graph.html` never exists — that is the default path, not an edge case.
+  Both terms are now required, matching `auto-update-memory.py`, which never dropped its rc check.
+
+  The skipped-viz note only says what it can establish: above the limit it names the limit, below
+  it it says the missing file is *unexpected* rather than prescribing the raise-the-limit remedy,
+  and after a failed opt-in regeneration it says so instead of suggesting the flag the user
+  already set.
+
+  Covered by two suites, both wired into `tests/smoke.sh` and therefore CI:
+  `tests/test_graph_viz_not_forced.py` (23 assertions; 5 fail against the old code — no
+  `cluster-only`, no `GRAPHIFY_VIZ_NODE_LIMIT` in the child env, exactly one subprocess call, the
+  note points at the opt-in, `=0` stays off) and `tests/test_setup_memory_graph_gate.sh`
+  (9 assertions against a stubbed `graphify` on `PATH`, no real CLI needed; 4 fail against the old
+  code). Between them they pin the gates that must NOT change: a missing `graph.html` is still a
+  success, a missing `graph.json` is still a failure even when graphify exits 0, and a non-zero
+  exit is still a failure even when a stale `graph.json` is on disk.
 
 - **`git worktree add` no longer re-embeds the entire code base (v0.13.0).** Field finding from a
   consuming repo: creating a worktree queued **17,387 files** for re-embedding — the whole

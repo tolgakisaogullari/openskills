@@ -33,6 +33,8 @@
 #   export SUMELA_PULL_CODE_REINGEST=1    # Qdrant code_chunks: force a FULL tree re-embed
 #   export SUMELA_DISABLE_UPDATE_CHECK=1  # don't probe upstream for a newer SumelaOS release
 #   export SUMELA_WORKTREE_SYNC=1       # sync on `git worktree add` too (default: skip — see post-checkout)
+#   export SUMELA_GRAPHIFY_VIZ=1        # force graphify's graph.html above its ~5000-node viz limit
+#                                       # (default: skip — a 2nd clustering pass + a huge unread HTML)
 # Override paths/endpoints: SUMELA_SUMMARIES_DIR, WIKI_PATH, QDRANT_HOST, QDRANT_PORT
 
 # Git's well-known empty-tree object (lets us diff a fresh clone's HEAD against

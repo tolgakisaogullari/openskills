@@ -104,7 +104,12 @@ def _echo_viz_warnings(*streams: str) -> None:
             if ("graph.html" in low or "visualiz" in low or "too large" in low
                     or "graphify_viz_node_limit" in low
                     or (("skip" in low or "viz" in low) and ("graph" in low or "html" in low))):
-                print("      " + line.strip())
+                print("      graphify: " + line.strip())
+
+
+# graphify's own default interactive-viz cap. Only used to word the "why is graph.html
+# missing" note correctly — the limit itself lives in graphify, we never override it.
+VIZ_NODE_LIMIT = 5000
 
 
 def run_graphify(project_root: Path, graph_dir: str = "graphify-out"):
@@ -112,8 +117,8 @@ def run_graphify(project_root: Path, graph_dir: str = "graphify-out"):
 
     `ok` is True when the query-critical graph.json is present — graph.html is a
     human-only interactive viz, so a skipped viz is reported as a NOTE, not a build
-    failure (mirrors setup-memory.{sh,ps1}, which treat a missing graph.html as a
-    flagged to-do, not a failed build, and never as a silent success).
+    failure and not a to-do (mirrors setup-memory.{sh,ps1}, which gate success on
+    graph.json for the same reason, and never report a silent success).
     """
     out_dir = project_root / graph_dir
     # AST-only rebuild: the `update <path>` SUBCOMMAND is graphify's no-LLM code-only
@@ -132,13 +137,26 @@ def run_graphify(project_root: Path, graph_dir: str = "graphify-out"):
         print("ERROR: graphify failed:", result.stderr)
         return False, None
     _echo_viz_warnings(result.stdout, result.stderr)
-    # graphify can exit 0 yet silently skip the interactive graph.html when the node
-    # count exceeds its viz limit. Force it: raise the limit above the real node count
-    # and regenerate the viz from the existing graph (cluster-only — no re-extraction).
+    # graphify skips the interactive graph.html above its ~5000-node viz limit. HONOR
+    # that skip: nothing in the retrieval path reads graph.html — Tier-2 is
+    # `query-graph.py`, which reads graph.json, and the wiki insights page is generated
+    # from GRAPH_REPORT.md — and no browser opens a viz that large anyway. Overriding
+    # the limit cost a SECOND full clustering pass plus a huge HTML write on EVERY
+    # pull: measured on a 193k-node repo, ~226 MB of unopenable HTML with Louvain run
+    # twice, one core pinned for the duration. Opt back in with SUMELA_GRAPHIFY_VIZ=1.
     html = out_dir / "graph.html"
-    if not html.exists() and (out_dir / "graph.json").exists():
+    forced_attempted = False
+    # Only an affirmative value opts in. "false"/"no"/"off" are the words a user reaches
+    # for to turn something OFF; reading them as truthy would restore the exact
+    # multi-minute stall this change removes.
+    want_viz = os.getenv("SUMELA_GRAPHIFY_VIZ", "").strip().lower() not in (
+        "", "0", "false", "no", "off")
+    if want_viz and not html.exists() and (out_dir / "graph.json").exists():
         nodes = _node_count(out_dir / "graph.json")
         env = {**os.environ, "GRAPHIFY_VIZ_NODE_LIMIT": str(nodes + 1000)}
+        forced_attempted = True
+        print(f"      SUMELA_GRAPHIFY_VIZ set — regenerating graph.html "
+              f"(viz limit raised to {nodes + 1000})…")
         cl = subprocess.run(["graphify", "cluster-only", "."], cwd=str(project_root),
                             capture_output=True, text=True, env=env)
         if cl.returncode != 0:
@@ -156,10 +174,23 @@ def run_graphify(project_root: Path, graph_dir: str = "graphify-out"):
     viz_note = None
     if not html.exists():
         nodes = _node_count(out_dir / "graph.json")
-        viz_note = (f"interactive graph.html skipped ({nodes} nodes exceeds graphify's "
-                    f"~5000-node viz limit); Tier-2 queries still work off graph.json. To build "
-                    f"it: GRAPHIFY_VIZ_NODE_LIMIT={nodes + 1000} graphify cluster-only .")
-        print("WARN  " + viz_note)
+        # Say only what is established. Above the viz limit a missing html is the
+        # EXPECTED outcome; below it, something else went wrong and pointing the user at
+        # the node-limit knob would send them down the wrong path.
+        if forced_attempted:
+            viz_note = ("SUMELA_GRAPHIFY_VIZ was set but the graph.html regeneration failed "
+                        "(see the WARN above) — Tier-2 queries are unaffected, they read graph.json.")
+        elif nodes > VIZ_NODE_LIMIT:
+            viz_note = (f"interactive graph.html skipped ({nodes} nodes, above graphify's "
+                        f"~{VIZ_NODE_LIMIT}-node viz limit) — expected, and nothing in the query "
+                        f"path needs it (Tier-2 reads graph.json). Want it anyway: "
+                        f"SUMELA_GRAPHIFY_VIZ=1 for this pull-time sync, or "
+                        f"GRAPHIFY_VIZ_NODE_LIMIT={nodes + 1000} graphify cluster-only .")
+        else:
+            viz_note = (f"graph.json is built ({nodes} nodes) but graph.html is missing — below "
+                        f"graphify's ~{VIZ_NODE_LIMIT}-node viz limit that is unexpected; check "
+                        f"graphify's output above. Tier-2 queries are unaffected (they read graph.json).")
+        print("INFO  " + viz_note)
     print("OK    graphify graph updated.")
     return True, viz_note
 

@@ -188,37 +188,27 @@ if ((Want "graphify-code-graph") -and (Test-Path (Join-Path $plugDir "graphify-c
             # extraction of doc/paper/image files and hard-fails without an LLM API
             # key, which this plugin deliberately does not require (AST-only by design).
             # Output is intentionally NOT suppressed so graphify's own viz/limit
-            # warnings reach the user. Success is gated on the artifact, not exit 0.
+            # warnings reach the user. Success is gated on the ARTIFACT THE QUERY PATH
+            # READS — graph.json — not on exit 0 and NOT on graph.html: Tier-2
+            # (query-graph.py) reads graph.json, the wiki insights page comes from
+            # GRAPH_REPORT.md, and nothing reads the viz. Above graphify's ~5000-node
+            # limit the viz is skipped by design; forcing it re-ran clustering and wrote
+            # a several-hundred-MB HTML nobody can open.
             graphify update .
             $built = $LASTEXITCODE
-            if (Test-Path "graphify-out/graph.html") {
-                Ok "Code graph built (graphify-out/, incl. interactive graph.html)"
-            } elseif (($built -eq 0) -and (Test-Path "graphify-out/graph.json")) {
-                # graph.json built but graph.html skipped (node count over graphify's viz
-                # limit). Force it: read the real node count, raise GRAPHIFY_VIZ_NODE_LIMIT
-                # above it, and regenerate the viz from the existing graph (cluster-only).
-                $nodes = 0
-                try {
-                    $g = Get-Content "graphify-out/graph.json" -Raw | ConvertFrom-Json
-                    $nv = if ($g.PSObject.Properties.Name -contains 'nodes') { $g.nodes } elseif ($g.graph) { $g.graph.nodes } else { $null }
-                    # Mirror the Python/bash hedge: a scalar count is the value itself; a
-                    # list/collection of node objects is counted. (Counting a scalar would
-                    # wrongly yield 1, leaving the raised limit below the real node count.)
-                    if ($nv -is [int] -or $nv -is [long] -or $nv -is [double]) { $nodes = [int]$nv }
-                    elseif ($null -ne $nv) { $nodes = @($nv).Count }
-                } catch { $nodes = 0 }
-                $limit = $nodes + 1000
-                Info "graph.html skipped by graphify's viz limit ($nodes nodes); raising to $limit and regenerating…"
-                $env:GRAPHIFY_VIZ_NODE_LIMIT = "$limit"
-                graphify cluster-only .
-                Remove-Item Env:\GRAPHIFY_VIZ_NODE_LIMIT -ErrorAction SilentlyContinue
+            # BOTH terms matter: exit code catches a failed rebuild, the artifact catches
+            # a "clean" exit that produced nothing. The artifact alone would report success
+            # whenever a stale graph.json survives a failed rebuild.
+            if (($built -eq 0) -and (Test-Path "graphify-out/graph.json")) {
                 if (Test-Path "graphify-out/graph.html") {
-                    Ok "Code graph built (graphify-out/, interactive graph.html via raised viz limit=$limit)"
+                    Ok "Code graph built (graphify-out/, incl. interactive graph.html)"
                 } else {
-                    Todo ('graph.html still missing — run: $env:GRAPHIFY_VIZ_NODE_LIMIT=' + $limit + '; graphify cluster-only .   (or accept JSON-only — graph.json is already built; Tier-2 queries work without graph.html)')
+                    Ok "Code graph built (graphify-out/graph.json — Tier-2 queries ready)"
+                    Info "interactive graph.html not built (graphify skips the viz above ~5000 nodes) — nothing in the query path needs it. Want it anyway: `$env:GRAPHIFY_VIZ_NODE_LIMIT=100000000; graphify cluster-only .   (SUMELA_GRAPHIFY_VIZ=1 covers the pull-time sync only, not this script)"
                 }
             } else {
-                Todo "build failed — run: graphify update ."
+                $staleNote = if (Test-Path "graphify-out/graph.json") { "graphify-out/graph.json is stale — left as-is" } else { "no graphify-out/graph.json" }
+                Todo "build failed (exit $built; $staleNote) — run: graphify update ."
             }
         } else { Todo "Build the code graph: graphify update ." }
     }

@@ -132,8 +132,23 @@ if command -v python3 >/dev/null 2>&1; then
   else
     bad "embedding bounds unit test failed"; sed 's/^/    /' "$WORK/embed_bounds.log" | tail -20
   fi
+  # Graph viz: forcing graph.html past graphify's node limit re-ran clustering and
+  # wrote hundreds of MB on every pull, for a file nothing in the query path reads.
+  if python3 "$REPO_ROOT/tests/test_graph_viz_not_forced.py" >"$WORK/graph_viz.log" 2>&1; then
+    ok "graph viz: not forced by default, graph.json is the success gate"
+  else
+    bad "graph viz unit test failed"; sed 's/^/    /' "$WORK/graph_viz.log" | tail -20
+  fi
 else
-  echo "  SKIP  get_repo_root + extra-ingest unit tests (python3 unavailable)"
+  echo "  SKIP  python unit tests (get_repo_root, extra-ingest, embedding bounds, graph viz) — python3 unavailable"
+fi
+
+# setup-memory graph gate: a failed `graphify update` over a stale graph.json must not
+# report "Code graph built" — and the skipped viz must not be forced or flagged as a to-do.
+if bash "$REPO_ROOT/tests/test_setup_memory_graph_gate.sh" >"$WORK/graph_gate.log" 2>&1; then
+  ok "setup-memory: graph build gate (exit code AND artifact)"
+else
+  bad "setup-memory graph gate test failed"; sed 's/^/    /' "$WORK/graph_gate.log" | tail -25
 fi
 
 # post-checkout: `git worktree add` hands the hook an all-zero prev HEAD, the same

@@ -82,6 +82,7 @@ developer runs it once per clone.
 | `SUMELA_DISABLE_CODE_SYNC` | (unset) | Set to `1` to turn off `code_chunks` entirely (no prune, no re-embed) |
 | `SUMELA_PULL_CODE_REINGEST` | (unset) | Set to `1` to force a FULL tree re-embed on every pull instead of the changed files |
 | `SUMELA_WORKTREE_SYNC` | (unset) | Set to `1` to sync on `git worktree add` too (default: skip — see [Worktrees](#worktrees)) |
+| `SUMELA_GRAPHIFY_VIZ` | (unset) | Set to `1` to force graphify's interactive `graph.html` on the pull-time graph refresh even above its ~5000-node viz limit (default: skip — it costs a second clustering pass and a very large HTML that nothing in the query path reads). Any value other than `0`/`false`/`no`/`off` counts as on |
 | `SUMELA_DISABLE_COLLECTION_MIGRATE` | (unset) | Set to `1` to skip the one-time per-project Qdrant collection migration |
 | `SUMELA_DISABLE_UPDATE_CHECK` | (unset) | Set to `1` to stop the pull-time "newer SumelaOS available" check (see below) |
 | `SUMELA_UPDATE_CHECK_INTERVAL` | `86400` | Seconds between upstream version probes (default once/day) |

@@ -71,13 +71,17 @@ This sets up git hooks that auto-rebuild the AST graph after every commit (no AP
   layer (extracting "why" from docs/PDFs/images) needs a **generative** LLM backend, which SumelaOS
   does **not** wire up — the Qdrant embedding model (`qwen3-embedding:0.6b`) is for vector search,
   not graph extraction. An AST-only graph is the expected, sufficient result; nothing is "missing".
-- **`graph.html` on large repos.** graphify skips the interactive `graph.html` when the node count
-  exceeds its viz limit (~5000 nodes). This affects only the human-facing visualization —
-  **Tier-2 queries (callers/callees/impact) read `graph.json`, so they work fully even when the viz
-  is skipped.** `setup-memory.{sh,ps1}` detects a missing `graph.html` (in the default
-  `graphify-out/` location), auto-raises `GRAPHIFY_VIZ_NODE_LIMIT` above the real node count, and
-  regenerates the viz from the existing graph (`graphify cluster-only .`). If it still can't produce
-  `graph.html`, it prints the exact command instead of reporting a false "built" — success is gated
+- **`graph.html` on large repos — skipped, and that is the correct outcome.** graphify skips the
+  interactive `graph.html` above its viz limit (~5000 nodes). This affects only the human-facing
+  visualization: **Tier-2 queries (callers/callees/impact) read `graph.json`**, and the
+  `graphify-insights` wiki page is generated from `GRAPH_REPORT.md` — nothing in the retrieval path
+  opens the HTML. `setup-memory.{sh,ps1}` and the pull-time graph sync therefore gate success on
+  **`graph.json`** and just report the skipped viz; they no longer raise `GRAPHIFY_VIZ_NODE_LIMIT`
+  to force it. Forcing it cost a second full clustering pass plus a several-hundred-MB HTML write
+  on every pull — measured on a 193k-node repo: ~226 MB of HTML no browser can open, Louvain run
+  twice, one core pinned throughout — for a file nothing reads. Want it anyway: set
+  `SUMELA_GRAPHIFY_VIZ=1` for the pull-time sync, or run
+  `GRAPHIFY_VIZ_NODE_LIMIT=100000000 graphify cluster-only .` by hand. Success is still gated
   on the artifact, never on exit 0. Extra views: `graphify tree --label "<Name>"` (D3 tree),
   `graphify export callflow-html` (Mermaid).
 - **`graphify-out/` is gitignored on purpose.** It is a per-developer, regenerable runtime artifact
@@ -95,6 +99,7 @@ All scripts accept CLI arguments and environment variables. CLI args take preced
 | Graph output directory | `--graph-dir` | `GRAPHIFY_OUT_DIR` | `graphify-out` |
 | Wiki path | `--wiki-path` | `WIKI_PATH` | `docs/second-brain/wiki` |
 | Project root | `--project-root` | `PROJECT_ROOT` | auto-detected |
+| Force the interactive `graph.html` | — | `SUMELA_GRAPHIFY_VIZ` | (unset — the viz is skipped above ~5000 nodes; pull-time sync only) |
 
 ### Examples
 

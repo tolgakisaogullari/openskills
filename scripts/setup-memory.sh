@@ -214,37 +214,27 @@ if want graphify-code-graph && [ -d "$PLUGDIR/graphify-code-graph" ]; then
       # plugin deliberately does not require (README: AST-only by design).
       # Output is intentionally NOT suppressed: graphify prints its own viz/limit
       # warnings (e.g. "graph has N nodes > 5000 limit — skipped graph.html") and we
-      # must surface them. Success is gated on the artifact, not exit 0 — graphify can
-      # exit 0 yet silently skip the interactive graph.html.
+      # must surface them. Success is gated on the ARTIFACT THE QUERY PATH READS —
+      # graph.json — not on exit 0 and NOT on graph.html: Tier-2 (`query-graph.py`)
+      # reads graph.json, the wiki insights page is generated from GRAPH_REPORT.md,
+      # and nothing reads the viz. Above graphify's ~5000-node limit the viz is
+      # skipped by design; forcing it re-ran clustering and wrote a several-hundred-MB
+      # HTML nobody can open, so we report the skip and move on.
       graphify update .; build_rc=$?
-      if [ -f graphify-out/graph.html ]; then
-        ok "Code graph built (graphify-out/, incl. interactive graph.html)"
-      elif [ "$build_rc" -eq 0 ] && [ -f graphify-out/graph.json ]; then
-        # graph.json built but graph.html skipped (node count over graphify's viz limit).
-        # Force it: read the real node count, raise GRAPHIFY_VIZ_NODE_LIMIT above it, and
-        # regenerate the viz from the existing graph (cluster-only is cheap — no re-extract).
-        nodes="$(python3 - <<'PY'
-import json
-try:
-    d = json.load(open("graphify-out/graph.json"))
-    n = d.get("nodes")
-    if n is None: n = d.get("graph", {}).get("nodes", [])
-    print(len(n) if isinstance(n, list) else int(n))
-except Exception:
-    print(0)
-PY
-)"
-        case "$nodes" in (*[!0-9]*|"") nodes=0 ;; esac   # guard arithmetic under `set -u`
-        limit=$(( nodes + 1000 ))
-        info "graph.html skipped by graphify's viz limit (${nodes:-?} nodes); raising to $limit and regenerating…"
-        GRAPHIFY_VIZ_NODE_LIMIT="$limit" graphify cluster-only .
+      # BOTH terms matter: rc catches a failed rebuild, the artifact catches a "clean"
+      # exit that produced nothing. Gating on the artifact ALONE would report success
+      # whenever a stale graph.json from an earlier run survives a failed rebuild —
+      # and on a large repo graph.json is the only gate left, so that is the default
+      # case, not an edge case.
+      if [ "$build_rc" -eq 0 ] && [ -f graphify-out/graph.json ]; then
         if [ -f graphify-out/graph.html ]; then
-          ok "Code graph built (graphify-out/, interactive graph.html via raised viz limit=$limit)"
+          ok "Code graph built (graphify-out/, incl. interactive graph.html)"
         else
-          manual "graph.html still missing — run: GRAPHIFY_VIZ_NODE_LIMIT=$limit graphify cluster-only .   (or accept JSON-only — graph.json is already built; Tier-2 queries work without graph.html)"
+          ok "Code graph built (graphify-out/graph.json — Tier-2 queries ready)"
+          info "interactive graph.html not built (graphify skips the viz above ~5000 nodes) — nothing in the query path needs it. Want it anyway: GRAPHIFY_VIZ_NODE_LIMIT=100000000 graphify cluster-only .   (SUMELA_GRAPHIFY_VIZ=1 covers the pull-time sync only, not this script)"
         fi
       else
-        manual "build failed — run: graphify update ."
+        manual "build failed (rc=$build_rc; graphify-out/graph.json $([ -f graphify-out/graph.json ] && echo "is stale — left as-is" || echo "missing")) — run: graphify update ."
       fi
     else
       manual "Build the code graph: graphify update ."
