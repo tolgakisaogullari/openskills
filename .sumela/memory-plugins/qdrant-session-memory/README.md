@@ -125,12 +125,15 @@ the authoritative source — this captures the session narrative.
 
 ## Graceful Degradation
 
-If Qdrant is unavailable:
-- `session-ingest.py` prints a warning and exits 0 (markdown summary is preserved)
-- `query-qdrant.py` prints a failure report and exits 1 (agent falls back to Tier-3)
-- `ingest-code-to-qdrant.py` and `ingest-wiki-to-qdrant.py` print failure reports and exit 1
+If Qdrant or Ollama is unavailable, every script prints a failure report and exits
+non-zero; the markdown in git is untouched, so nothing is lost and a re-run catches up.
 
-Exit codes for the two ingest scripts are three-valued — do NOT read non-zero as
+- `session-ingest.py` exits `1` (one summary is atomic — see below)
+- `query-qdrant.py` exits `1` (agent falls back to Tier-3)
+- `ingest-code-to-qdrant.py` and `ingest-wiki-to-qdrant.py` exit `1`, or `2` when the run
+  completed but left some entries stale
+
+Exit codes for the two bulk ingest scripts are three-valued — do NOT read non-zero as
 "the backend is down":
 
 | Code | Meaning | What to do |
@@ -143,3 +146,10 @@ A file is ingested **all-or-nothing**: if any of its chunks fails, its existing 
 left alone. An incomplete entry is worse than a stale one — retrieval would answer
 confidently from a file it only half knows. Re-run the script to finish the job; the
 report names the affected files and the run exits `2`.
+
+`session-ingest.py` is **two-valued** (`0` / `1`), not three: it handles ONE summary and
+computes every embedding before deleting the old points, so the outcome is binary —
+either the summary is in the index or the index is unchanged. There is no partial state
+for a `2` to describe. It exits `1` on any embed or upsert failure; it used to exit `0`
+while printing a warning, which reported success to the pull hook and produced a silent
+"memory did not update".

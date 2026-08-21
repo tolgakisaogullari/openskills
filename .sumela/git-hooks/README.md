@@ -35,7 +35,7 @@ This directory holds two independent concerns: **enforcement** (`pre-commit`) an
 |---|---|---|
 | `pre-commit` | `git commit` | Runs `scripts/validate-structure.sh --check-placeholders` when the commit touches the agent-control surface / second-brain. Blocks on failure. Bypass: `git commit --no-verify`; disable: `export SUMELA_DISABLE_PRECOMMIT=1`. Same check as CI. |
 | `post-merge` | `git merge`, merge step of `git pull` (clean merges only) | Re-ingest session summaries / wiki / code changed in `ORIG_HEAD..HEAD` into local Qdrant + refresh the code graph. Self-gates: no-op without the Qdrant plugin. |
-| `post-checkout` | `git checkout`/`switch`, `git clone` | Same, for `prev..new` (empty-tree on clone). |
+| `post-checkout` | `git checkout`/`switch`, `git clone`, `git worktree add` | Same, for `prev..new` (empty-tree on clone). On **`git worktree add`** the Qdrant syncs are skipped — the collections are per-project and `graphify-out/` belongs to the main checkout, whose tree did not change, so every sync is skipped (only the rate-limited update check runs). See *Worktrees* below. |
 | `post-commit` | `git commit` (acts only on **merge commits**) | Safety net for **conflicted** merges: git skips `post-merge` on a conflict and runs commit hooks on the manual resolution commit instead. On a merge commit (≥2 parents) runs the same syncs for `HEAD^1..HEAD`; on any ordinary commit it is a cheap no-op (immediate `exit 0`). |
 | `_lib.sh` | (sourced by the memory hooks) | shared memory-sync logic |
 
@@ -77,6 +77,12 @@ developer runs it once per clone.
 |---|---|---|
 | `SUMELA_DISABLE_PRECOMMIT` | (unset) | Set to `1` to disable the pre-commit validation hook for your clone |
 | `SUMELA_DISABLE_MEMORY_SYNC` | (unset) | Set to `1` to disable the memory-sync hooks for your clone |
+| `SUMELA_DISABLE_GRAPH_SYNC` | (unset) | Set to `1` to stop the pull-time graphify code-graph refresh |
+| `SUMELA_DISABLE_WIKI_SYNC` | (unset) | Set to `1` to stop re-ingesting changed wiki pages into `wiki_pages` |
+| `SUMELA_DISABLE_CODE_SYNC` | (unset) | Set to `1` to turn off `code_chunks` entirely (no prune, no re-embed) |
+| `SUMELA_PULL_CODE_REINGEST` | (unset) | Set to `1` to force a FULL tree re-embed on every pull instead of the changed files |
+| `SUMELA_WORKTREE_SYNC` | (unset) | Set to `1` to sync on `git worktree add` too (default: skip — see [Worktrees](#worktrees)) |
+| `SUMELA_DISABLE_COLLECTION_MIGRATE` | (unset) | Set to `1` to skip the one-time per-project Qdrant collection migration |
 | `SUMELA_DISABLE_UPDATE_CHECK` | (unset) | Set to `1` to stop the pull-time "newer SumelaOS available" check (see below) |
 | `SUMELA_UPDATE_CHECK_INTERVAL` | `86400` | Seconds between upstream version probes (default once/day) |
 | `SUMELA_SUMMARIES_DIR` | `$WIKI_PATH/session-summaries` | Where session summaries live |
@@ -113,6 +119,56 @@ is recommended. Privacy: the probe is an anonymous tag listing of a public repo 
 discloses only your IP to the host (as any git operation does) and sends no project
 data. Opt out entirely with `export SUMELA_DISABLE_UPDATE_CHECK=1`.
 
+## Worktrees
+
+`git worktree add` hands `post-checkout` an **all-zero previous HEAD** — byte-for-byte
+the same signal `git clone` gives. The two need opposite handling:
+
+| | Local derived caches | Correct action |
+|---|---|---|
+| `git clone` | nothing indexed yet | diff against the empty tree, ingest everything |
+| `git worktree add` | Qdrant already populated (collections are namespaced **per project**, not per worktree) | skip the Qdrant syncs |
+
+Treating a worktree as a fresh clone marks *every tracked file* as added and re-embeds
+the whole tree for zero gain. Field report from a consuming repo: **17,387 files** queued,
+Ollama pinned at 68% CPU, still spinning 28 minutes after the last log line.
+
+The hook tells them apart with `git rev-parse --git-dir` vs `--git-common-dir`, which
+differ only in a linked worktree. `_sumela_is_linked_worktree` normalizes both to
+physical paths first, because git returns them in **mixed forms** depending on cwd —
+from a subdirectory of the main checkout `--git-dir` is absolute while
+`--git-common-dir` is `../.git`, which an un-normalized string compare misreads as a
+worktree. Git chdirs to the working-tree root before running a hook, so the hook itself
+never sees that cwd; the normalization is what keeps the *helper's* answer independent
+of cwd, and `tests/test_post_checkout_worktree.sh` pins it by calling the helper
+directly from a subdirectory (case 5b — the one assertion that fails if the
+normalization is removed).
+
+**Every sync is skipped, including `graph_sync`.** `setup.sh` wires a **relative**
+`core.hooksPath`, and git resolves that against the **main** working tree, so
+`git worktree add` runs the *main checkout's* hook and `SUMELA_INSTALL_ROOT` — derived
+from `$0` — is the **main checkout**, even though cwd is the worktree (pinned by case 7).
+Every derived cache therefore belongs to the main checkout: the Qdrant collections
+(namespaced per project) and `graphify-out/` alike. Creating a worktree changes nothing
+in the main checkout's tree, so there is nothing to refresh; with `prev` rewritten to the
+empty tree, graphify's change filter would always match and rebuild main's graph in full
+for no reason. Only `sumela_update_check` runs — a rate-limited notice unrelated to the
+tree — and `sumela_collections_migrate` is skipped with the syncs, since its only job is
+to prepare the collections *before* an ingest and no ingest runs here.
+
+The skip notice is printed only when Qdrant is actually reachable: the plugin directory
+is tracked in git, so its presence proves nothing about whether this install has a
+backend the syncs would have touched.
+
+Opting back in: `SUMELA_WORKTREE_SYNC=1 git worktree add …` forces the full path. It is
+deliberately its own variable rather than a reuse of `SUMELA_PULL_CODE_REINGEST`, which
+is documented as a permanent `export` — reusing it would silently disable this guard for
+anyone who had set it once.
+
+Note that this gate applies **only** to worktree *creation* (the all-zero HEAD). A later
+`git checkout` inside a worktree carries a real previous HEAD and syncs normally — see
+*Known limitations* for what that means when worktrees sit on different branches.
+
 ## Known limitations
 
 - **`git pull --rebase`** does not fire `post-merge` (rebased commits are not
@@ -132,6 +188,28 @@ data. Opt out entirely with `export SUMELA_DISABLE_UPDATE_CHECK=1`.
   Because `session-ingest.py` deletes-by-`session_id` then upserts deterministic
   IDs from the same source file, the steady state is always correct; only a
   sub-second window where a concurrent query sees partial chunks is possible.
+- **`chat_history` has no initial-population path outside a hooks-wired clone.** The
+  other two collections each have one: `wiki_pages` is seeded by `setup-memory.sh`, and
+  `ingest-code-to-qdrant.py` promotes an incremental run to a **full walk** whenever
+  `code_chunks` is empty, so the first pull that touches code builds the whole index.
+  Session summaries have neither — they are only ever ingested by a hook, and
+  every hook path except a fresh clone is strictly range-incremental. A teammate who
+  clones (hooks not yet wired, so `post-checkout` never fires), wires hooks with
+  `setup.sh --hooks-only`, and then only ever pulls/checks out gets an empty
+  `chat_history` — the committed summaries are never backfilled. This is independent of
+  worktrees; the `git worktree add` empty-tree diff used to mask it by accident, which is
+  the same accident that re-embedded the whole tree. Remedy today: loop
+  `session-ingest.py` over the summaries dir once.
+- **A checkout inside a worktree indexes the MAIN checkout's content.** Because
+  `SUMELA_INSTALL_ROOT` is the main checkout (see *Worktrees*), a real `git checkout`
+  inside worktree B hands the ingest B's changed **paths** while the ingest resolves and
+  reads them under **main's** tree (`get_repo_root()` walks up from the script's own
+  location). Paths that exist only on B's branch are silently skipped
+  (`ingest-code-to-qdrant.py` `is_file()` guard); paths present in both are re-embedded
+  from main's revision. So the index stays consistent with the main checkout and is not
+  corrupted by worktree activity — but a worktree's branch-only code is never indexed,
+  and a checkout there causes a pointless re-embed of main's copies. Query from a
+  worktree accordingly: results describe the main checkout.
 - **Newline characters in a summary filename** are unsupported (the diff is
   newline-delimited). Session summaries use date/topic slugs, so this does not
   occur in practice.

@@ -22,6 +22,7 @@ Execute these steps strictly in order. DO NOT announce the skill.
    - If the plan or user specifies a base branch/ref, create from it: `git worktree add <path> -b <branch_name> <base-ref>`. Otherwise create from current `HEAD`: `git worktree add <path> -b <branch_name>`.
    - Run: `cd <path>`
    - *CRITICAL CONTEXT WARNING:* Ensure ALL subsequent operations, terminal commands, and subagent dispatches in this session occur strictly within this new `<path>`. In tool-based IDEs, explicitly set every command's working directory to `<path>`; do not rely on a prior `cd` persisting.
+   - *MEMORY NOTE:* Creating a worktree does NOT rebuild the memory index or the code graph, by design — both are per-project caches owned by the MAIN checkout, and nothing they derive from has changed (see `.sumela/git-hooks/README.md` → Worktrees). So Tier-1/Tier-2 retrieval still works from inside the worktree, but it describes the main checkout: code you write here is not indexed until it is merged and pulled there. Do not "fix" this by forcing a re-embed — that re-embeds the whole tree for no gain.
 
 4. ENVIRONMENT SETUP:
    - Auto-detect and install dependencies based on project files:

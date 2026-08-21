@@ -16,10 +16,44 @@ flag="$3"
 
 # On a fresh clone, prev is all-zeros. Diff the new HEAD against the empty tree
 # so every existing summary is treated as added (initial local population).
+first=0
 case "$prev" in
   *[!0]*) : ;;                 # contains a non-zero char -> a real previous HEAD
-  *)      prev="$SUMELA_EMPTY_TREE" ;;
+  *)      prev="$SUMELA_EMPTY_TREE"; first=1 ;;
 esac
+
+# `git worktree add` sends the SAME all-zero prev as `git clone`, but it is NOT a
+# fresh clone and must not take the empty-tree path. Two measured facts decide this:
+#
+#   1. The derived caches are shared, not per-worktree. Qdrant collections are
+#      namespaced per PROJECT. And `setup.sh` wires a RELATIVE core.hooksPath, which
+#      git resolves against the MAIN working tree — so on `git worktree add` the hook
+#      that runs is the main checkout's copy and SUMELA_INSTALL_ROOT is the MAIN
+#      checkout, cwd notwithstanding (measured: $0 = /main/.sumela/git-hooks/...,
+#      cwd = /wt). graphify's output dir therefore belongs to the main checkout too.
+#   2. Nothing the caches derive from has changed. The main checkout's tree is
+#      untouched by creating a worktree, and the collections are already populated.
+#
+# So every sync here is pure waste, and the empty-tree diff makes it maximal: it
+# marks every tracked file as "added" (measured in a consuming repo at 17,387 files,
+# which pinned Ollama at 68% CPU and never converged) and forces a full graphify
+# rebuild of the main checkout, while the worktree gains nothing.
+#
+# Only sumela_update_check runs — a rate-limited notice, unrelated to the tree.
+# sumela_collections_migrate is skipped with the syncs: its only job is to prepare
+# the collections BEFORE an ingest, and no ingest runs on this path.
+#
+# Escape hatch: SUMELA_WORKTREE_SYNC=1 forces the full path. Deliberately its OWN
+# variable — SUMELA_PULL_CODE_REINGEST is documented as a permanent `export`, so
+# reusing it would silently disable this guard for anyone who set it once.
+if [ "$first" = 1 ] && [ -z "${SUMELA_WORKTREE_SYNC:-}" ] && _sumela_is_linked_worktree; then
+  # Say so only when there is a reachable Qdrant this would otherwise have touched;
+  # the plugin directory is tracked in git, so its presence proves nothing.
+  _sumela_qdrant_up && \
+    echo "sumela: new worktree — derived caches belong to the main checkout and are already built; skipping sync (SUMELA_WORKTREE_SYNC=1 forces it)"
+  sumela_update_check
+  exit 0
+fi
 
 # Migrate LOCAL Qdrant collections to per-project namespacing BEFORE the Qdrant syncs.
 # If it DEFERS (another migrate in progress / unresolved), skip the three Qdrant syncs

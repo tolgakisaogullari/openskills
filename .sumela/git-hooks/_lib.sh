@@ -32,11 +32,40 @@
 #   export SUMELA_DISABLE_CODE_SYNC=1     # Qdrant code_chunks: off entirely (no prune/embed)
 #   export SUMELA_PULL_CODE_REINGEST=1    # Qdrant code_chunks: force a FULL tree re-embed
 #   export SUMELA_DISABLE_UPDATE_CHECK=1  # don't probe upstream for a newer SumelaOS release
+#   export SUMELA_WORKTREE_SYNC=1       # sync on `git worktree add` too (default: skip — see post-checkout)
 # Override paths/endpoints: SUMELA_SUMMARIES_DIR, WIKI_PATH, QDRANT_HOST, QDRANT_PORT
 
 # Git's well-known empty-tree object (lets us diff a fresh clone's HEAD against
 # "nothing", so every existing summary counts as added on first checkout).
 SUMELA_EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# Is this a LINKED worktree (created by `git worktree add`) rather than the main
+# checkout? `git worktree add` hands post-checkout an ALL-ZERO "previous HEAD" —
+# byte-for-byte the same signal `git clone` gives — yet the two need opposite
+# handling, so the hook has to tell them apart by something other than $1.
+#
+# --git-dir and --git-common-dir differ ONLY in a linked worktree. Both must be
+# normalized to physical paths first, because git returns them in MIXED forms and a
+# raw string compare is wrong. Measured here (git 2.50.1):
+#
+#   main checkout, cwd = repo root:  --git-dir .git                --git-common-dir .git
+#   main checkout, cwd = scripts/:   --git-dir /abs/repo/.git      --git-common-dir ../.git
+#   linked worktree:                 --git-dir /abs/repo/.git/worktrees/NAME
+#                                    --git-common-dir /abs/repo/.git
+#
+# The second row is the trap: an un-normalized compare reads the MAIN checkout as
+# "linked" whenever the hook runs from a subdirectory, which would disable every
+# sync for everyone. Any failure (git too old for --git-common-dir, unreadable path)
+# returns 1 = "not linked", so the fallback is always the pre-existing behaviour.
+_sumela_is_linked_worktree() {
+  local gitdir commondir
+  gitdir="$(git rev-parse --git-dir 2>/dev/null)"               || return 1
+  commondir="$(git rev-parse --git-common-dir 2>/dev/null)"     || return 1
+  [ -n "$gitdir" ] && [ -n "$commondir" ]                       || return 1
+  gitdir="$(cd "$gitdir" 2>/dev/null && pwd -P)"                || return 1
+  commondir="$(cd "$commondir" 2>/dev/null && pwd -P)"          || return 1
+  [ "$gitdir" != "$commondir" ]
+}
 
 # The SumelaOS install may live in a monorepo SUBDIR, not at the git root. Resolve
 # the install root ONCE from this file's own location (it lives at

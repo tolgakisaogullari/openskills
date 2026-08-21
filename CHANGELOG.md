@@ -103,6 +103,74 @@ check can detect a newer upstream via `git ls-remote --tags`.
 
 ### Fixed
 
+- **`git worktree add` no longer re-embeds the entire code base (v0.13.0).** Field finding from a
+  consuming repo: creating a worktree queued **17,387 files** for re-embedding — the whole
+  tree — pinning `ollama serve` at 68% CPU with no progress 28 minutes after the last log
+  line, and every upsert failing with a 500 from `/api/embeddings`. Root cause: `git
+  worktree add` hands `post-checkout` an **all-zero previous HEAD**, byte-for-byte the same
+  signal `git clone` gives, and the hook mapped both to the empty-tree diff so every tracked
+  file counted as "added". Correct for a clone; wrong for a worktree, where nothing the
+  derived caches are built from has changed.
+
+  `post-checkout` now discriminates via a new `_sumela_is_linked_worktree` (`--git-dir` vs
+  `--git-common-dir`, compared on **normalized physical paths** — git returns them in mixed
+  forms depending on cwd, `/abs/.git` vs `../.git` from a subdirectory, and a raw string
+  compare misreads the main checkout as a worktree). On worktree creation **every** sync is
+  skipped — the three Qdrant syncs, the collection migrate, and `graph_sync` — leaving only
+  the rate-limited update check.
+
+  `graph_sync` is skipped for the same reason as the rest, which took measuring to
+  establish: `setup.sh` wires a **relative** `core.hooksPath`, git resolves it against the
+  **main** working tree, so `git worktree add` runs the *main checkout's* hook and
+  `SUMELA_INSTALL_ROOT` is the main checkout even though cwd is the worktree. Every derived
+  cache — Qdrant collections and `graphify-out/` alike — belongs to the main checkout, whose
+  tree a new worktree does not touch. An earlier revision of this fix kept `graph_sync` on
+  the mistaken premise that the graph was per-worktree; it would have forced a full graphify
+  rebuild of the main checkout on every `git worktree add`.
+
+  Clone behaviour, in-worktree checkouts, and main-checkout checkouts are unchanged. Opt back
+  in with `SUMELA_WORKTREE_SYNC=1` — its own variable, not a reuse of the permanently
+  `export`ed `SUMELA_PULL_CODE_REINGEST`, which would have disabled the guard for anyone who
+  set it once. The skip notice is gated on Qdrant actually being reachable (the plugin
+  directory is tracked in git, so its presence proves nothing).
+
+  Covered by `tests/test_post_checkout_worktree.sh` (7 cases / 19 assertions, wired into CI):
+  5 assertions fail against the old hook; case 5b calls `_sumela_is_linked_worktree` directly
+  from a subdirectory — the only level where the mixed path forms occur — and fails if the
+  normalization is dropped; case 7 pins the relative-`core.hooksPath` install-root fact the
+  whole design rests on, which the absolute path used by the other cases cannot show.
+
+  Two pre-existing gaps found while doing this and documented in
+  `.sumela/git-hooks/README.md` rather than papered over here: `chat_history` has no
+  initial-population path outside a hooks-wired clone (every other hook path is
+  range-incremental, and `setup-memory.sh` seeds only `wiki_pages`), and a checkout inside a
+  worktree indexes the **main** checkout's content because the ingest resolves the
+  worktree's changed paths under main's tree. The worktree empty-tree diff masked the first
+  by accident — the same accident being fixed here.
+
+- **`session-ingest.py` reported success after a failed ingest (v0.13.0).** The companion to
+  the embedding fix above, found by reviewing this release: the two bulk ingests got the new
+  three-valued exit contract, but the summary path kept `sys.exit(0)` on every failure — it
+  printed `WARNING: Qdrant upsert failed` and still told its caller it had succeeded. That
+  caller is the pull hook, so the observable result was the silent "memory did not update"
+  the field report described. It now exits `1` when an embed or the upsert fails, matching
+  the `PARTIAL` status it was already printing. Deliberately **two**-valued, not three: one
+  summary is atomic (every embedding is computed before the old points are deleted), so there
+  is no partial state for a `2` to describe. `_lib.sh` already invoked it as
+  `python3 "$ingest" ... || echo "WARN: ingest failed"` inside a detached background
+  subshell, so a non-zero exit is what the caller always expected and git is still never
+  failed. It also gained the `ollama_preflight` its two siblings got, so a stopped backend is
+  reported once instead of being rediscovered chunk by chunk while sleeping through the retry
+  budget. The plugin README's "Graceful Degradation" section documented the old
+  exit-0 behaviour and is corrected.
+
+- **`.sumela/.heal-last` was committed as a tracked file (v0.13.0).** The withdrawal of the
+  self-healing index correctly deleted the four `.gitignore` / `sumela-gitignore.list` entries
+  for its runtime markers, but the same commit also committed one of those markers — a bare
+  unix timestamp — leaving a stray tracked file that no code writes any more and that every
+  consuming repo would inherit. Removed; the ignore-rule deletions stay, since nothing
+  references those paths.
+
 - **Embedding: an over-long chunk killed the Ollama model runner and silently punched
   holes in the index (v0.13.0).** Field finding from a consuming repo: one ingest run
   lost **2496 chunks across 617 files** while reporting `SUCCESS`. Ollama loads an

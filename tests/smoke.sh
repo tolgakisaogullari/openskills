@@ -136,6 +136,14 @@ else
   echo "  SKIP  get_repo_root + extra-ingest unit tests (python3 unavailable)"
 fi
 
+# post-checkout: `git worktree add` hands the hook an all-zero prev HEAD, the same
+# signal `git clone` gives — treating it as a clone re-embedded the whole tree.
+if bash "$REPO_ROOT/tests/test_post_checkout_worktree.sh" >"$WORK/worktree_hook.log" 2>&1; then
+  ok "post-checkout: clone vs. \`git worktree add\` discrimination"
+else
+  bad "post-checkout worktree test failed"; sed 's/^/    /' "$WORK/worktree_hook.log" | tail -25
+fi
+
 echo ""
 echo "Run 2 — idempotency (re-run must not duplicate)"
 if run_setup; then ok "second setup.sh run exited 0"; else bad "second setup.sh run exited non-zero"; sed 's/^/    /' "$WORK/setup.log" | tail -25; fi

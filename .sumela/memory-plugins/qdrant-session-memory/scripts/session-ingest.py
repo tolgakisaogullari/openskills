@@ -59,7 +59,7 @@ from lib.memory_ingest import (
     # chunk_text/get_embedding live in the lib so the embedding-input bounds they carry
     # apply to EVERY path. Private copies here and in query-qdrant.py were the reason a
     # fix to the lib alone would have left the summary and query paths still crashing.
-    chunk_text, get_embedding,
+    chunk_text, get_embedding, ollama_preflight,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -254,6 +254,17 @@ def main():
     print(f"[session-ingest] Decisions extracted: {len(decisions)}")
     print(f"[session-ingest] Affected files: {len(affected_files)}")
 
+    # Preflight the embedding backend BEFORE any work. Without it a stopped Ollama is
+    # discovered one chunk at a time, each attempt sleeping through its retry budget in a
+    # detached background process launched from a git hook. Exit 1 = could-not-run, which
+    # is what the pull hook logs as "ingest failed" (see _lib.sh sumela_memory_sync).
+    backend_error = ollama_preflight(args.ollama_url)
+    if backend_error:
+        print(f"[session-ingest] {backend_error}")
+        report_success(session_id, len(chunks), False, len(decisions), len(affected_files),
+                       developer=developer, domains=domains)
+        sys.exit(1)
+
     qdrant_ok = False
     try:
         client = QdrantClient(host=args.host, port=args.port, check_compatibility=False)
@@ -306,7 +317,13 @@ def main():
 
     report_success(session_id, len(chunks), qdrant_ok, len(decisions), len(affected_files),
                    developer=developer, domains=domains)
-    sys.exit(0)
+    # Exit code must MATCH the report: this used to always exit 0, so a failed embed or a
+    # failed upsert printed "WARNING" and still told the caller it had succeeded — the
+    # silent "memory did not update" the field report described. There is no exit-2
+    # (ran-but-stale) case here the way there is for the bulk ingests: one summary is
+    # ingested atomically (every embedding is computed BEFORE the delete above), so the
+    # outcome is binary. 0 = ingested, 1 = could not.
+    sys.exit(0 if qdrant_ok else 1)
 
 
 if __name__ == "__main__":

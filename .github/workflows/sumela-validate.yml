@@ -4,7 +4,8 @@ name: SumelaOS Validate
 # (skills, rules, registries, wiki templates, generated AGENTS.md / RULE_REGISTRY)
 # cannot silently drift. Mirrors `scripts/validate-structure.sh` — the same check
 # the pre-commit hook runs locally. Also runs `tests/smoke.sh`, an end-to-end check
-# that setup.sh renders + registers correctly and is idempotent on re-run.
+# that setup.sh renders + registers correctly and is idempotent on re-run and which
+# also drives the tests/ unit suites (including the post-checkout worktree test).
 #
 # Not on GitHub? See docs/second-brain/template/ADOPTION_GUIDE.md for a GitLab CI
 # / Azure Pipelines equivalent (both just run the same script).
