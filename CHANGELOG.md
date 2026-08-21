@@ -164,6 +164,14 @@ check can detect a newer upstream via `git ls-remote --tags`.
   budget. The plugin README's "Graceful Degradation" section documented the old
   exit-0 behaviour and is corrected.
 
+- **Python bytecode caches were not ignored in consuming repos (v0.13.0).** This repo's own
+  `.gitignore` carries the generic `__pycache__/` rule, but `scripts/lib/sumela-gitignore.list`
+  — the single source setup/update seed into a consuming project's `.gitignore` — did not, so
+  running any memory script left untracked `__pycache__/` directories under `.sumela/` in every
+  non-Python project (a .NET or Node consumer has no reason to ignore Python artifacts). Added
+  as `.sumela/**/__pycache__/`, scoped to `.sumela/` on purpose: this is SumelaOS's own runtime
+  artifact, not a rule about the consumer's source tree.
+
 - **`.sumela/.heal-last` was committed as a tracked file (v0.13.0).** The withdrawal of the
   self-healing index correctly deleted the four `.gitignore` / `sumela-gitignore.list` entries
   for its runtime markers, but the same commit also committed one of those markers — a bare
