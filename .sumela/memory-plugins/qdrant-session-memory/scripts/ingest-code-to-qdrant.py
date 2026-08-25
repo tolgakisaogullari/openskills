@@ -23,7 +23,10 @@ What it does:
        chunk by TOKENS — the two differ by up to 4x, see lib.memory_ingest.
     5. Generates embeddings via Ollama (qwen3-embedding:0.6b) in parallel.
     6. Deletes existing points for the file (idempotency) and upserts new chunks
-       into Qdrant 'code_chunks' collection with structured payload.
+       into Qdrant 'code_chunks' collection with structured payload. If the DELETE
+       fails the upsert is SKIPPED — point ids are deterministic per (file, chunk),
+       so writing over a failed delete cannot remove a longer tail from an earlier
+       version — and the file is counted as STALE in the report.
     7. Prints a structured status report for the agent to relay to the user.
 
 Payload schema per point:
@@ -44,7 +47,9 @@ Environment:
       lib.memory_ingest and the plugin README's Configuration table
 
 Exit codes: 0 = index fully refreshed · 2 = ran, some entries left stale (re-run) ·
-1 = could not run (Qdrant/Ollama unreachable).
+1 = could not run / nothing written or destroyed (Qdrant/Ollama unreachable, client
+missing). A failed delete-by-filter is 2, not 1: the backend answered, the entries are
+just stale.
 """
 import sys, os, fnmatch, argparse
 from pathlib import Path
@@ -63,20 +68,24 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 def report_success(files_ingested: int, chunk_count: int, qdrant_ok: bool, mode: str,
-                   files_skipped: int = 0, upsert_failed: int = 0):
-    clean = qdrant_ok and not files_skipped and not upsert_failed
+                   files_skipped: int = 0, upsert_failed: int = 0, delete_failed: int = 0):
+    clean = qdrant_ok and not files_skipped and not upsert_failed and not delete_failed
     lines = [
         f"Status: {'SUCCESS' if clean else 'PARTIAL'}",
         f"Mode: {mode}",
         f"Files ingested: {files_ingested}",
         f"Total chunks: {chunk_count}",
-        f"Qdrant upsert: {'OK' if qdrant_ok else 'FAILED'}",
+        # SKIPPED, not FAILED: when every delete failed the upsert was never attempted,
+        # and "FAILED" would point at a write that never happened.
+        f"Qdrant upsert: {'OK' if qdrant_ok else ('SKIPPED' if delete_failed else 'FAILED')}",
     ]
     if files_skipped:
         lines.append(f"Files SKIPPED (embedding failed, left unchanged): {files_skipped}")
     if upsert_failed:
         lines.append(f"Files whose points were DELETED but not replaced (upsert failed): {upsert_failed}")
-    if files_skipped or upsert_failed:
+    if delete_failed:
+        lines.append(f"Files left STALE (delete failed, upsert skipped): {delete_failed}")
+    if files_skipped or upsert_failed or delete_failed:
         lines.append("Action: re-run this ingest; these files are NOT up to date in the index.")
     print_report("CODE INGEST REPORT", lines)
 
@@ -417,23 +426,50 @@ def main():
 
     total_chunks = 0
     files_ingested = 0
-    upserted_ok = set()
     upsert_failed = set()
+    delete_failed = set()
 
     for rel_path, chunks_data in files.items():
         # Delete ALL existing points for this file (by file_path) BEFORE upserting, so a
         # file that shrank does not leave stale higher-index chunks behind. Safe only
         # because every chunk of this file embedded successfully — files with any
         # failure were removed above and never reach this delete.
-        try:
-            client.delete(
-                collection_name=COLLECTION_NAME,
-                points_selector=Filter(
-                    must=[FieldCondition(key="file_path", match=MatchValue(value=rel_path))]
-                ),
-            )
-        except Exception as e:
-            print(f"[warn] delete failed for {rel_path}: {e}")
+        #
+        # ONE retry before giving up. The delete had no retry at all, and the failure
+        # this guard catches is typically a client-side TIMEOUT — where the request may
+        # well have been accepted and COMPLETED server-side and only the response was
+        # lost. Skipping the upsert in that case would leave the entry ENTIRELY ABSENT
+        # from the index, which is worse than the stale tail the guard exists to prevent
+        # (absence is not staleness — retrieval cannot surface it at all). A second
+        # delete is idempotent: if the first one landed, this one removes nothing,
+        # succeeds, and the upsert proceeds normally.
+        deleted, delete_error = False, None
+        for _attempt in range(2):
+            try:
+                client.delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=Filter(
+                        must=[FieldCondition(key="file_path", match=MatchValue(value=rel_path))]
+                    ),
+                )
+                deleted = True
+                break
+            except Exception as e:      # noqa: BLE001 — reported below if both fail
+                delete_error = e
+        if not deleted:
+            # SKIP the upsert. Point ids are deterministic per (file, chunk_index), so
+            # writing over a failed delete rewrites 0..n-1 but CANNOT remove a longer
+            # tail left by an earlier version: a file that shrank from 40 chunks to 12
+            # keeps chunks 12-39 of the old content, carrying a stale total_chunks in
+            # their payload, and retrieval then answers confidently from code that no
+            # longer exists. That is the same silent hole the all-or-nothing rule closes
+            # on the embed side — and until this guard it was reported as SUCCESS with
+            # exit 0, because a delete failure landed in neither failure set.
+            delete_failed.add(rel_path)
+            print(f"[warn] delete failed twice for {rel_path}: {delete_error} — upsert SKIPPED so a "
+                  f"stale tail cannot survive under new points; this file's entry may be "
+                  f"STALE or partially removed, re-run to restore it")
+            continue
 
         points = []
         for cd in chunks_data:
@@ -457,7 +493,6 @@ def main():
             client.upsert(collection_name=COLLECTION_NAME, points=points)
             total_chunks += len(points)
             files_ingested += 1
-            upserted_ok.add(rel_path)
             print(f"  Ingested: {rel_path} ({len(points)} chunks)")
         except Exception as e:
             # The delete above already ran, so this file's points are GONE. That is the
@@ -469,19 +504,29 @@ def main():
 
 
     qdrant_ok = total_chunks > 0
+    # "Did it RUN?" is a different question from "did anything land?". A delete-by-filter
+    # that fails for EVERY file (a dropped payload index, a permission change, a
+    # read-only collection) writes nothing, so total_chunks stays 0 — yet
+    # ensure_collection already answered, the backend is reachable, and the entries are
+    # merely STALE. Exiting 1 there tells the operator to "fix the dependency named in
+    # the report" (plugin README) when no dependency is broken, which is the exact
+    # confusion the tri-state split exists to prevent. upsert_failed counts as "ran" for
+    # the same reason: those points were deleted, so the write stage was demonstrably
+    # reached. Only a run that neither wrote nor destroyed anything is still 1.
+    ran = qdrant_ok or bool(upsert_failed) or bool(delete_failed)
     report_success(files_ingested, total_chunks, qdrant_ok, mode,
-                   len(failed_files), len(upsert_failed))
+                   len(failed_files), len(upsert_failed), len(delete_failed))
     # Exit space is three-valued on purpose. Collapsing "ran, but N entries are stale"
     # into the same 1 as "could not run at all" made setup-memory.sh tell the operator
     # seeding was skipped when 99 of 100 files had in fact landed.
     #   0 = index fully refreshed
     #   2 = ran, but some entries are NOT up to date (re-run to finish)
     #   1 = could not run / nothing ingested
-    if failed_files or upsert_failed:
+    if failed_files or upsert_failed or delete_failed:
         # It RAN — the preflights passed — so "could not run, fix the dependency" would
         # send the operator chasing a healthy backend. But when NOTHING landed, "some
         # entries are stale" understates it just as badly, so that stays 1.
-        sys.exit(2 if qdrant_ok else 1)
+        sys.exit(2 if ran else 1)
     sys.exit(0 if qdrant_ok else 1)
 
 

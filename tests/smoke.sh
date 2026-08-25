@@ -128,9 +128,16 @@ if command -v python3 >/dev/null 2>&1; then
   # Embedding input bounds: an over-long prompt aborts the Ollama model runner, which
   # 500s every concurrent request too — silently losing chunks from the index.
   if python3 "$REPO_ROOT/tests/test_embedding_bounds.py" >"$WORK/embed_bounds.log" 2>&1; then
-    ok "embedding bounds: byte-based token cap, num_batch, retry"
+    ok "embedding bounds: byte-based token cap, num_batch, retry, degenerate vectors"
   else
     bad "embedding bounds unit test failed"; sed 's/^/    /' "$WORK/embed_bounds.log" | tail -20
+  fi
+  # Delete guard: a failed delete-by-filter used to fall through to the upsert, leaving
+  # a shrunk file's stale tail in the index and reporting SUCCESS with exit 0.
+  if python3 "$REPO_ROOT/tests/test_ingest_delete_guard.py" >"$WORK/delete_guard.log" 2>&1; then
+    ok "ingest delete guard: failed delete skips the upsert (code + wiki twins)"
+  else
+    bad "ingest delete guard test failed"; sed 's/^/    /' "$WORK/delete_guard.log" | tail -20
   fi
   # Graph viz: forcing graph.html past graphify's node limit re-ran clustering and
   # wrote hundreds of MB on every pull, for a file nothing in the query path reads.
@@ -140,7 +147,7 @@ if command -v python3 >/dev/null 2>&1; then
     bad "graph viz unit test failed"; sed 's/^/    /' "$WORK/graph_viz.log" | tail -20
   fi
 else
-  echo "  SKIP  python unit tests (get_repo_root, extra-ingest, embedding bounds, graph viz) — python3 unavailable"
+  echo "  SKIP  python unit tests (get_repo_root, extra-ingest, embedding bounds, delete guard, graph viz) — python3 unavailable"
 fi
 
 # setup-memory graph gate: a failed `graphify update` over a stale graph.json must not

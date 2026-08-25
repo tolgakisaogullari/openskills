@@ -447,6 +447,49 @@ def chunk_text(text: str, size: int = EMBED_CHUNK_WORDS,
     return chunks
 
 
+class EmbeddingRejected(ValueError):
+    """A well-formed 200 carrying an unusable vector. Deliberately NOT retried.
+
+    Unlike a 500 from a runner that died on somebody else's oversized prompt — transient
+    collateral damage, worth one retry — this is DETERMINISTIC: a runner loaded without
+    embedding support answers every chunk with zeros. Retrying it spends 2 requests and a
+    full EMBED_RETRY_DELAY on every chunk of the walk (at 20k chunks over 4 workers,
+    hours of pure sleeping in a detached background process launched from a git hook) to
+    arrive at the same rejection. That is exactly the cost hole `ollama_preflight` exists
+    to prevent, and the preflight cannot see this one: GET /api/tags answers fine.
+
+    Subclasses ValueError so existing callers that catch ValueError are unaffected.
+    """
+
+
+def _vector_is_usable(vector) -> bool:
+    """False for an all-zero or non-finite vector — a soft backend failure that the
+    dimension check cannot see.
+
+    llama-server emits a CORRECTLY SIZED all-zero vector on internal embedding failures
+    (both when the model is loaded without embedding support and when
+    `llama_get_embeddings_*` returns nothing), and Ollama's L2 normalization does not
+    turn that into an error: sum == 0 yields norm = 1/1e-12, and 0 * 1e12 is still 0, so
+    no NaN or Inf ever appears. The result is a 200 carrying a well-formed 1024-dim
+    vector of zeros that passes every check this module used to make, gets upserted as a
+    normal point, and is then compared under COSINE against every future query — a
+    degenerate distance for a chunk retrieval will still confidently return.
+
+    Same family as the empty-array case the dimension check above already covers; this
+    is the half that check is blind to.
+    """
+    total = 0.0
+    for x in vector:
+        # isinstance FIRST: math.isfinite raises TypeError on a str/None element, which
+        # would surface as "must be real number, not str" instead of the message above.
+        if not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(x):
+            return False
+        total += x * x
+    # `any` guards the theoretical case where every component is below ~1.5e-162 and the
+    # sum of squares underflows to 0.0 while the vector is legitimate.
+    return total > 0.0 or any(vector)
+
+
 def get_embedding(text: str, ollama_url: str, model: str = DEFAULT_EMBED_MODEL,
                   timeout: int = 120, retries: int = 1) -> List[float]:
     """Embed one string. Raises on failure so the caller can record it.
@@ -483,7 +526,13 @@ def get_embedding(text: str, ollama_url: str, model: str = DEFAULT_EMBED_MODEL,
             # points were deleted — a hole created by a "successful" embed.
             if len(vector) != EMBED_DIM:
                 raise ValueError(f"embedding has {len(vector)} dims, expected {EMBED_DIM}")
+            if not _vector_is_usable(vector):
+                raise EmbeddingRejected(
+                    "embedding is all-zero, non-finite or non-numeric — a soft backend "
+                    "failure that passes the dimension check")
             return vector
+        except EmbeddingRejected:
+            raise                   # deterministic — see EmbeddingRejected's docstring
         except Exception as e:      # noqa: BLE001 — re-raised below once retries are spent
             last_error = e
             if attempt < retries:

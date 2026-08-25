@@ -83,6 +83,10 @@ These triggers require an explicit user query:
 - Walks `src/` for code files (`.cs`, `.ts`, `.tsx`, `.py`, `.go`, `.rs`, `.java`, `.js`, `.jsx`)
 - Excludes build artifacts, dependencies, generated files, and secrets
 - Upserts into Qdrant `code_chunks` collection
+- Failure semantics: `0` clean · `2` ran but some entries are STALE (the report names
+  them under `left STALE` / `DELETED but not replaced`) · `1` could not run. On a
+  non-zero exit, relay the report to the user and tell them to re-run — a `2` is NOT a
+  backend outage.
 - Configurable via env vars: `SRC_DIR`, `CODE_PATTERNS`, `CODE_CHUNKS_COLLECTION`
 
 ## Wiki Ingestion (Background)
@@ -93,6 +97,10 @@ These triggers require an explicit user query:
 - Walks `docs/second-brain/wiki/` for `.md` files (excluding special files like `_INDEX.md`, `_LOG.md`)
 - Parses YAML frontmatter for metadata
 - Upserts into Qdrant `wiki_pages` collection
+- Failure semantics: `0` clean · `2` ran but some entries are STALE (the report names
+  them under `left STALE` / `DELETED but not replaced`) · `1` could not run. On a
+  non-zero exit, relay the report to the user and tell them to re-run — a `2` is NOT a
+  backend outage.
 - Configurable via env vars: `WIKI_DIR`, `WIKI_PAGES_COLLECTION`
 
 ## Scripts Reference

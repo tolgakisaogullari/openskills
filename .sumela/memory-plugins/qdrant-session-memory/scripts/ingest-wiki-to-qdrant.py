@@ -14,7 +14,10 @@ What it does:
        the two differ by up to 4x, see lib.memory_ingest.
     4. Generates embeddings via Ollama (qwen3-embedding:0.6b) in parallel.
     5. Deletes existing points for the page (idempotency) and upserts new chunks
-       into Qdrant 'wiki_pages' collection with structured payload.
+       into Qdrant 'wiki_pages' collection with structured payload. If the DELETE
+       fails the upsert is SKIPPED — point ids are deterministic per (page, chunk),
+       so writing over a failed delete cannot remove a longer tail from an earlier
+       version — and the page is counted as STALE in the report.
     6. Prints a structured status report for the agent to relay to the user.
 
 Payload schema per point:
@@ -33,6 +36,14 @@ Environment:
     QDRANT_PORT defaults to 6333
     WIKI_PAGES_COLLECTION defaults to wiki_pages
     WIKI_DIR defaults to docs/second-brain/wiki (relative to repo root)
+    EXTRA_INGEST_DIRS / .sumela/ingest.conf — extra doc dirs, see lib.memory_ingest
+    SUMELA_EMBED_NUM_BATCH / _MAX_TOKENS / _MAX_WORKERS / _RETRY_DELAY — see
+      lib.memory_ingest and the plugin README's Configuration table
+
+Exit codes: 0 = index fully refreshed · 2 = ran, some entries left stale (re-run) ·
+1 = could not run / nothing written or destroyed (Qdrant/Ollama unreachable, client
+missing). A failed delete-by-filter is 2, not 1: the backend answered, the pages are
+just stale.
 """
 from __future__ import annotations
 
@@ -54,19 +65,22 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 def report_success(pages_ingested: int, chunk_count: int, qdrant_ok: bool,
-                   pages_skipped: int = 0, upsert_failed: int = 0):
-    clean = qdrant_ok and not pages_skipped and not upsert_failed
+                   pages_skipped: int = 0, upsert_failed: int = 0, delete_failed: int = 0):
+    clean = qdrant_ok and not pages_skipped and not upsert_failed and not delete_failed
     lines = [
         f"Status: {'SUCCESS' if clean else 'PARTIAL'}",
         f"Pages ingested: {pages_ingested}",
         f"Total chunks: {chunk_count}",
-        f"Qdrant upsert: {'OK' if qdrant_ok else 'FAILED'}",
+        # SKIPPED, not FAILED — see the code-ingest twin.
+        f"Qdrant upsert: {'OK' if qdrant_ok else ('SKIPPED' if delete_failed else 'FAILED')}",
     ]
     if pages_skipped:
         lines.append(f"Pages SKIPPED (embedding failed, left unchanged): {pages_skipped}")
     if upsert_failed:
         lines.append(f"Pages whose points were DELETED but not replaced (upsert failed): {upsert_failed}")
-    if pages_skipped or upsert_failed:
+    if delete_failed:
+        lines.append(f"Pages left STALE (delete failed, upsert skipped): {delete_failed}")
+    if pages_skipped or upsert_failed or delete_failed:
         lines.append("Action: re-run this ingest; these pages are NOT up to date in the index.")
     print_report("WIKI INGEST REPORT", lines)
 
@@ -223,6 +237,7 @@ def main():
     total_chunks = 0
     pages_ingested = 0
     upsert_failed = set()
+    delete_failed = set()
 
     # Collect all chunks first for parallel embedding
     all_jobs = []  # (page_path, page_title, fm, chunk_index, chunk_text, total_chunks)
@@ -292,15 +307,32 @@ def main():
     for page_path, chunks_data in pages.items():
         # Delete existing points for this page. Safe only because every chunk of this
         # page embedded successfully — pages with any failure were removed above.
-        try:
-            client.delete(
-                collection_name=COLLECTION_NAME,
-                points_selector=Filter(
-                    must=[FieldCondition(key="page_path", match=MatchValue(value=page_path))]
-                ),
-            )
-        except Exception as e:
-            print(f"[warn] delete failed for {page_path}: {e}")
+        # ONE retry before giving up — see the code-ingest twin: a lost RESPONSE is not
+        # a failed request, and skipping the upsert after a delete that DID land would
+        # remove the page from the index entirely rather than leave it stale.
+        deleted, delete_error = False, None
+        for _attempt in range(2):
+            try:
+                client.delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=Filter(
+                        must=[FieldCondition(key="page_path", match=MatchValue(value=page_path))]
+                    ),
+                )
+                deleted = True
+                break
+            except Exception as e:      # noqa: BLE001 — reported below if both fail
+                delete_error = e
+        if not deleted:
+            # SKIP the upsert — see the code-ingest twin for the full reasoning: point
+            # ids are deterministic per (page, chunk_index), so writing over a failed
+            # delete cannot remove a longer tail from an earlier version, leaving a
+            # silently partial page that used to be reported as SUCCESS with exit 0.
+            delete_failed.add(page_path)
+            print(f"[warn] delete failed twice for {page_path}: {delete_error} — upsert SKIPPED so a "
+                  f"stale tail cannot survive under new points; this page's entry may be "
+                  f"STALE or partially removed, re-run to restore it")
+            continue
 
         points = []
         for cd in chunks_data:
@@ -341,11 +373,15 @@ def main():
                   f"and NOT replaced; re-run to restore")
 
     qdrant_ok = total_chunks > 0
-    report_success(pages_ingested, total_chunks, qdrant_ok, len(failed_pages), len(upsert_failed))
+    # See the code-ingest twin: a total delete failure RAN (the backend answered
+    # ensure_collection) and leaves pages stale — that is 2, not "could not run".
+    ran = qdrant_ok or bool(upsert_failed) or bool(delete_failed)
+    report_success(pages_ingested, total_chunks, qdrant_ok, len(failed_pages),
+                   len(upsert_failed), len(delete_failed))
     # 0 = fully refreshed · 2 = ran, some pages stale · 1 = could not run.
     # See the code-ingest twin for why 2 is separate from 1.
-    if failed_pages or upsert_failed:
-        sys.exit(2 if qdrant_ok else 1)   # see the code-ingest twin
+    if failed_pages or upsert_failed or delete_failed:
+        sys.exit(2 if ran else 1)   # see the code-ingest twin
     sys.exit(0 if qdrant_ok else 1)
 
 

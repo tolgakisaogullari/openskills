@@ -201,6 +201,45 @@ def main():
     check("an empty embedding is rejected rather than stored",
           isinstance(raised, ValueError))
 
+    # --- the half the dimension check is blind to: a CORRECTLY SIZED bad vector -----
+    # llama-server emits an all-zero vector of the right width on internal embedding
+    # failures, and Ollama's L2 normalization does not turn that into an error (sum==0
+    # gives norm=1/1e-12, and 0*1e12 is still 0 — no NaN, no Inf). So a soft backend
+    # failure arrived as a 200 with a well-formed 1024-dim vector, passed every check
+    # this module made, and was upserted as a normal point that then answers COSINE
+    # queries from nothing. The empty-array case was already closed; this was not.
+    calls = install_fake_requests([_FakeResponse({"embedding": [0.0] * DIM}),
+                                   _FakeResponse({"embedding": [0.0] * DIM})])
+    raised = None
+    try:
+        get_embedding("merhaba", "http://localhost:11434")
+    except Exception as e:      # noqa: BLE001
+        raised = e
+    check("an all-zero embedding is rejected rather than stored",
+          isinstance(raised, ValueError))
+
+    # NaN/Inf cannot come from normalization, but a corrupt response or a future
+    # backend can still carry them, and they poison every comparison they touch.
+    for label, bad in (("NaN", float("nan")), ("Inf", float("inf"))):
+        vec = [0.1] * DIM
+        vec[DIM // 2] = bad
+        calls = install_fake_requests([_FakeResponse({"embedding": vec}),
+                                       _FakeResponse({"embedding": vec})])
+        raised = None
+        try:
+            get_embedding("merhaba", "http://localhost:11434")
+        except Exception as e:  # noqa: BLE001
+            raised = e
+        check(f"a vector containing {label} is rejected rather than stored",
+              isinstance(raised, ValueError))
+
+    # The guard must not be so eager that it rejects a legitimate vector: a single
+    # non-zero component is enough, and negative components are normal.
+    calls = install_fake_requests([_FakeResponse({"embedding": [0.0] * (DIM - 1) + [-0.5]})])
+    ok = get_embedding("merhaba", "http://localhost:11434")
+    check("a sparse but non-degenerate vector is still accepted",
+          ok == [0.0] * (DIM - 1) + [-0.5])
+
     sys.modules.pop("requests", None)
 
 

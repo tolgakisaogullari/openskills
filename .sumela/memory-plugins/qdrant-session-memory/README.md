@@ -125,13 +125,15 @@ the authoritative source — this captures the session narrative.
 
 ## Graceful Degradation
 
-If Qdrant or Ollama is unavailable, every script prints a failure report and exits
-non-zero; the markdown in git is untouched, so nothing is lost and a re-run catches up.
+If Qdrant or Ollama is unavailable — **or reachable but rejecting a write** — every
+script prints a report and exits non-zero; the markdown in git is untouched, so nothing
+is lost and a re-run catches up.
 
 - `session-ingest.py` exits `1` (one summary is atomic — see below)
 - `query-qdrant.py` exits `1` (agent falls back to Tier-3)
 - `ingest-code-to-qdrant.py` and `ingest-wiki-to-qdrant.py` exit `1`, or `2` when the run
-  completed but left some entries stale
+  reached the write stage but left some entries stale — including the case where a
+  delete-by-filter failed for *every* file and nothing landed at all
 
 Exit codes for the two bulk ingest scripts are three-valued — do NOT read non-zero as
 "the backend is down":
@@ -139,13 +141,22 @@ Exit codes for the two bulk ingest scripts are three-valued — do NOT read non-
 | Code | Meaning | What to do |
 |---|---|---|
 | `0` | Index fully refreshed | nothing |
-| `2` | Ran, but some entries are stale — an embed or upsert failed and those files were left untouched rather than half-written | re-run; the report names them |
-| `1` | Could not run (Qdrant or Ollama unreachable, client missing) | fix the dependency named in the report |
+| `2` | Ran, but some entries are stale — an embed, a **delete-by-filter**, or an upsert failed. An embed or delete failure leaves the entry at its previous content; an upsert failure leaves it deleted and unreplaced. The report distinguishes them | re-run; the report names them |
+| `1` | Could not run — nothing was written *or* destroyed (Qdrant/Ollama unreachable, client missing) | fix the dependency named in the report |
 
 A file is ingested **all-or-nothing**: if any of its chunks fails, its existing points are
 left alone. An incomplete entry is worse than a stale one — retrieval would answer
 confidently from a file it only half knows. Re-run the script to finish the job; the
 report names the affected files and the run exits `2`.
+
+The same rule covers the **delete** half of the refresh. Each file is written by deleting
+its existing points by filter and upserting the new ones; point ids are deterministic per
+`(file, chunk_index)`, so writing over a *failed* delete rewrites `0..n-1` but cannot
+remove a longer tail from an earlier version — a file that shrank from 40 chunks to 12
+would keep chunks 12-39 of the old content. So a delete that fails **twice** (it is
+retried once, because a lost response is not a failed request) skips the upsert entirely
+and the entry is reported as `left STALE`. Because nothing is written in that case, the
+report line reads `Qdrant upsert: SKIPPED`, not `FAILED`.
 
 `session-ingest.py` is **two-valued** (`0` / `1`), not three: it handles ONE summary and
 computes every embedding before deleting the old points, so the outcome is binary —

@@ -9,6 +9,83 @@ check can detect a newer upstream via `git ls-remote --tags`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed Qdrant delete no longer leaves a stale tail and reports SUCCESS (v0.15.0).** Both bulk
+  ingests refresh a file idempotently as DELETE-by-filter then UPSERT. The delete sat in a
+  `try/except` that printed `[warn] delete failed for <path>` and then **fell through to the
+  upsert**, and a delete failure was recorded in neither failure set — so the run printed
+  `Ingested: <path>`, reported `Status: SUCCESS` and exited **0**.
+
+  Point ids are deterministic per `(file, chunk_index)`, so upserting over a failed delete
+  rewrites indices `0..n-1` but **cannot remove a longer tail from an earlier version**. A file
+  that shrank from 40 chunks to 12 kept chunks 12-39 of the *old* content, carrying a stale
+  `total_chunks` in their payload, and retrieval then answered confidently from code that no
+  longer exists. That is precisely the silent hole the all-or-nothing rule closes on the embed
+  side — the upsert branch immediately below it was already written with that care ("its points
+  were deleted and NOT replaced; re-run to restore"); the delete branch was not.
+
+  A delete is now **retried once** — a lost *response* is not a failed *request*, and skipping the
+  upsert after a delete that did land server-side would remove the entry from the index entirely,
+  which is worse than the stale tail this guard exists to prevent. A delete that fails twice
+  **skips the upsert**, is collected in a `delete_failed` set, and is named in the report
+  (`Files/Pages left STALE (delete failed, upsert skipped): N`). The warning says only what is
+  known — the entry "may be STALE or partially removed" — rather than claiming it was left
+  unchanged, which the client cannot verify. Fixed in **both** twins.
+
+  **The exit code required a second fix that review caught.** Skipping the upsert leaves
+  `total_chunks == 0`, and the exit was derived from `qdrant_ok = total_chunks > 0` — so a delete
+  that failed for *every* file (a dropped payload index, a permission change, a read-only
+  collection — a whole-corpus failure mode, unlike an embed failure) exited **`1`**, which the
+  plugin README maps to "could not run — fix the dependency named in the report". No dependency is
+  broken there and the report names none: `ensure_collection` had already answered. The exit now
+  derives from whether the run *reached the write stage* (`qdrant_ok or upsert_failed or
+  delete_failed`), so that case is `2`. Fixing it in Python means the hand-maintained
+  `setup-memory.{sh,ps1}` twins need no edit — they already branch correctly on `2`. Relatedly,
+  `Qdrant upsert:` now reads `SKIPPED` rather than `FAILED` when no upsert was ever attempted, and
+  the pull-time hooks (`_lib.sh`) no longer collapse `2` into `WARN: … ingest failed` — that is
+  the path a delete failure actually reaches in the field, and it was burying an actionable,
+  re-runnable state behind a backend-outage message.
+
+- **An all-zero or non-finite embedding is no longer stored (v0.15.0).** `get_embedding` validated
+  only the vector's WIDTH. llama-server emits a **correctly sized all-zero** vector on internal
+  embedding failures (both when the model is loaded without embedding support and when
+  `llama_get_embeddings_*` returns nothing), and Ollama's L2 normalization does not turn that into
+  an error — `sum == 0` yields `norm = 1/1e-12` and `0 * 1e12` is still `0`, so no NaN or Inf ever
+  surfaces. The result was a 200 carrying a well-formed 1024-dim vector of zeros that passed every
+  check, was upserted as a normal point, and then sat in the corpus answering COSINE queries from
+  nothing. Same family as the empty-array soft failure the width check already covered; this was
+  the half it was blind to. `get_embedding` now rejects a vector that is all-zero or contains a
+  non-finite component, so the caller records it as a failed chunk and the all-or-nothing rule
+  leaves the file untouched. Centralized in the lib, so the ingest, session and query paths all
+  inherit it.
+
+  The rejection is **not retried**, via a dedicated `EmbeddingRejected(ValueError)`. Review measured
+  the naive version: a runner loaded without embedding support returns zeros for *every* chunk, so
+  a retry spends 2 requests and a full `SUMELA_EMBED_RETRY_DELAY` per chunk — at 20k chunks over 4
+  workers, hours of pure sleeping in a detached process launched from a git hook, to reach the same
+  rejection. That is verbatim the cost hole `ollama_preflight` exists to prevent, and the preflight
+  cannot see this one (`GET /api/tags` answers fine). Measured after the fix: one HTTP call, no
+  sleep. A 500 from a dead runner is still retried — that one really is transient.
+
+  Covered by two suites, both wired into `tests/smoke.sh` and therefore CI:
+  `tests/test_ingest_delete_guard.py` (22 assertions; **16 fail against the old code**, while its 6
+  healthy-path controls pass in both directions, so the test measures the guard and not itself — it
+  loads each ingest against a stub Qdrant and a stub Ollama, no live service) and the extended
+  `tests/test_embedding_bounds.py` (**3 new assertions fail against the old lib**, plus a
+  false-positive guard asserting a sparse-but-valid vector is still accepted).
+
+  The delete-guard suite was **mutation-tested**, and the first cut failed it: with every file
+  failing the delete, `qdrant_ok` is already False and the other failure sets are already empty, so
+  both `delete_failed` terms were short-circuited and a mutant that dropped either one survived
+  with all assertions green. A mixed scenario (one entry stale, the rest healthy) is the only shape
+  that exercises them, and it is the only shape that produces the `2` the contract promises. Both
+  mutants are now killed.
+
+  Also removed: `upserted_ok` in the code twin, assigned and added to but never read since it was
+  introduced, and absent from the wiki twin — leaving two parallel tracking sets where one was
+  live and one inert.
+
 ### Added
 
 - **`SUMELA_GRAPHIFY_VIZ` (v0.14.0)** — opt back in to graphify's interactive `graph.html` on the

@@ -449,7 +449,17 @@ sumela_wiki_sync() {  # $1 = "from" ref, $2 = "to" ref
     # Removed pages: drop their orphaned embeddings (page_path = repo-relative path).
     [ -n "$deleted" ] && { echo "Pruning removed pages:"; _sumela_delete_orphans "$install" wiki_pages page_path path "$deleted"; }
     # Added/modified pages: re-ingest (whole-wiki walk; idempotent per-page upsert).
-    [ -n "$changed" ] && { echo ">>> re-ingesting wiki pages"; python3 "$ingest" || echo "WARN: wiki ingest failed"; }
+    # Exit 2 is NOT a failure: the ingest ran and named the pages it left stale. Calling
+    # that "failed" sends the reader looking for a broken backend that is in fact healthy.
+    if [ -n "$changed" ]; then
+      echo ">>> re-ingesting wiki pages"
+      python3 "$ingest"; _rc=$?
+      case "$_rc" in
+        0) ;;
+        2) echo "NOTE: some wiki pages were left STALE (see the report above) — re-run: python3 $ingest" ;;
+        *) echo "WARN: wiki ingest failed (rc=$_rc)" ;;
+      esac
+    fi
     echo "===== wiki-sync: done ====="
   ) >>"$log" 2>&1 </dev/null &
   return 0
@@ -526,13 +536,19 @@ sumela_code_sync() {  # $1 = "from" ref, $2 = "to" ref
   ( trap '[ -n "$changed_list" ] && rm -f "$changed_list"' EXIT   # clean up even if cd below fails
     cd "$install" || exit 0
     echo "===== code-sync(ingest) @ $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) ====="
-    local ok=0
+    local rc=0
     if [ -n "$full" ]; then
-      python3 "$ingest" || ok=1
+      python3 "$ingest"; rc=$?
     else
-      python3 "$ingest" --changed-file "$changed_list" || ok=1
+      python3 "$ingest" --changed-file "$changed_list"; rc=$?
     fi
-    [ "$ok" -ne 0 ] && echo "WARN: code ingest failed"
+    # Three-valued on purpose — see the plugin README. Collapsing 2 into "failed" hid an
+    # actionable, re-runnable state behind a backend-outage message.
+    case "$rc" in
+      0) ;;
+      2) echo "NOTE: some code entries were left STALE (see the report above) — re-run: python3 $ingest" ;;
+      *) echo "WARN: code ingest failed (rc=$rc)" ;;
+    esac
     echo "===== code-sync: done ====="
   ) >>"$log" 2>&1 </dev/null &
   return 0
